@@ -168,17 +168,18 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.markdown("### 🔧 Parámetros de auditoría")
-
-    base_liquidacion = st.selectbox(
-        "Base de días usada en la liquidación",
-        options=[360, 365],
-        index=0,
-        help="Revise la nota al pie del documento. Si dice 'T.I.C. dividida por 360 días', seleccione 360.",
+    st.markdown("### 📄 Sentencia (opcional)")
+    uploaded_sentencia = st.file_uploader(
+        "Cargar PDF de la sentencia",
+        type=["pdf"],
+        help="Opcional. Si se sube, la herramienta verifica que la liquidación respete lo ordenado en la sentencia.",
     )
-
-    base_correcta = 365
-    st.caption(f"Base correcta (Ley 18.010, Art. 11): **{base_correcta} días**")
+    if uploaded_sentencia:
+        st.caption("✓ Sentencia cargada — se activará la verificación legal.")
+    else:
+        st.caption("Sin sentencia — solo se auditarán los números.")
+    st.caption("La base de días (360 o 365) se detecta automáticamente desde el PDF y se verifica su consistencia.")
+    base_liquidacion = 360  # valor por defecto, se sobreescribe con detección automática
 
     st.markdown("---")
     st.markdown("### 📋 Datos del escrito")
@@ -634,29 +635,143 @@ def auditar_comision(df_raw: pd.DataFrame, texto_pdf: str) -> list[dict]:
     return alertas
 
 
-def auditar_base_dias(df_raw: pd.DataFrame, base_liq: int) -> list[dict]:
-    """Alerta global si la base de días de la liquidación no es 365."""
+def auditar_base_dias(df_raw: pd.DataFrame, base_liq: int, texto_pdf: str) -> list[dict]:
+    """
+    Verifica DOS cosas sobre la base de días:
+    1. ¿El tribunal declara expresamente qué base usa?
+    2. ¿Es consistente en todas las filas?
+    No penaliza el uso de 360 si está declarado y es consistente.
+    """
     alertas = []
-    if base_liq != 365:
-        total_int_liq   = df_raw["interes_liq"].sum() if "interes_liq" in df_raw.columns else 0
-        total_int_corr  = sum(
-            calcular_interes(r["capital"], r["dias"], r["tasa"], 365)
-            for _, r in df_raw.iterrows()
-            if r["capital"] > 0 and r["dias"] > 0
-        )
-        exceso          = total_int_liq - total_int_corr
-        pct_exceso      = (exceso / total_int_corr * 100) if total_int_corr > 0 else 0
 
+    # ── 1. ¿Lo declara expresamente? ──
+    texto_lower = texto_pdf.lower()
+    declara_360 = any(p in texto_lower for p in [
+        "360 días", "360 dias", "dividida por 360", "dividido por 360",
+        "base 360", "año de 360", "factor de 360",
+    ])
+    declara_365 = any(p in texto_lower for p in [
+        "365 días", "365 dias", "dividida por 365", "dividido por 365",
+        "base 365", "año de 365",
+    ])
+
+    if not declara_360 and not declara_365:
         alertas.append({
-            "nivel": "roja",
-            "titulo": f"🚨 BASE DE CÁLCULO INCORRECTA — Se usaron {base_liq} días en vez de 365",
+            "nivel": "amarilla",
+            "titulo": "Base de días no declarada en la liquidación",
             "detalle": (
-                f"El Art. 11 de la Ley N° 18.010 exige base de 365 días. "
-                f"El uso de {base_liq} días genera un exceso de **{fmt_clp(exceso)}** "
-                f"({pct_exceso:.2f}%) sobre el total de intereses. "
-                f"Factor de exceso: {365/base_liq:.4f}x"
+                f"La liquidación no indica expresamente qué base de días utiliza "
+                f"(360 o 365). Toda liquidación debe declarar este criterio para "
+                f"permitir su verificación. La base detectada según los cálculos "
+                f"es {base_liq} días."
             ),
         })
+    else:
+        base_declarada = 360 if declara_360 else 365
+        if base_declarada != base_liq:
+            alertas.append({
+                "nivel": "amarilla",
+                "titulo": f"Discrepancia entre base declarada y base aplicada",
+                "detalle": (
+                    f"La liquidación declara base {base_declarada} días, "
+                    f"pero los cálculos detectados corresponden a base {base_liq} días."
+                ),
+            })
+
+    # ── 2. ¿Es consistente en todas las filas? ──
+    if df_raw.empty or "capital" not in df_raw.columns:
+        return alertas
+
+    inconsistencias = []
+    for _, row in df_raw.iterrows():
+        cap  = row.get("capital", 0)
+        dias = row.get("dias", 0)
+        tasa = row.get("tasa", 0)
+        int_liq = row.get("interes_liq", 0)
+        if cap <= 0 or dias <= 0 or tasa <= 0 or int_liq <= 0:
+            continue
+
+        int_360 = calcular_interes(cap, dias, tasa, 360)
+        int_365 = calcular_interes(cap, dias, tasa, 365)
+
+        diff_360 = abs(int_liq - int_360)
+        diff_365 = abs(int_liq - int_365)
+
+        # Tolerancia del 1% para redondeos
+        tolerancia = int_liq * 0.01
+
+        usa_360 = diff_360 <= tolerancia
+        usa_365 = diff_365 <= tolerancia
+
+        if not usa_360 and not usa_365:
+            inconsistencias.append({
+                "factura": row.get("numero", "?"),
+                "int_liq": int_liq,
+                "int_360": int_360,
+                "int_365": int_365,
+                "diff_360": diff_360,
+                "diff_365": diff_365,
+            })
+
+    if inconsistencias:
+        detalle_items = " | ".join(
+            f"Factura {i['factura']}: liquidado {fmt_clp(i['int_liq'])} "
+            f"(360d→{fmt_clp(i['int_360'])}, 365d→{fmt_clp(i['int_365'])})"
+            for i in inconsistencias[:3]
+        )
+        alertas.append({
+            "nivel": "roja",
+            "titulo": f"🚨 INCONSISTENCIA EN BASE DE DÍAS — {len(inconsistencias)} fila(s) no cuadran con ninguna base",
+            "detalle": (
+                f"Las siguientes facturas no corresponden ni a base 360 ni a base 365, "
+                f"lo que sugiere errores aritméticos o cambios de criterio no declarados. "
+                f"{detalle_items}"
+            ),
+        })
+    else:
+        # Verificar que todas usen LA MISMA base
+        bases_usadas = set()
+        for _, row in df_raw.iterrows():
+            cap  = row.get("capital", 0)
+            dias = row.get("dias", 0)
+            tasa = row.get("tasa", 0)
+            int_liq = row.get("interes_liq", 0)
+            if cap <= 0 or dias <= 0 or tasa <= 0 or int_liq <= 0:
+                continue
+            int_360 = calcular_interes(cap, dias, tasa, 360)
+            int_365 = calcular_interes(cap, dias, tasa, 365)
+            tol = int_liq * 0.01
+            if abs(int_liq - int_360) <= tol:
+                bases_usadas.add(360)
+            elif abs(int_liq - int_365) <= tol:
+                bases_usadas.add(365)
+
+        if len(bases_usadas) > 1:
+            alertas.append({
+                "nivel": "roja",
+                "titulo": "🚨 BASE DE DÍAS MIXTA — Se mezclan 360 y 365 días en distintas filas",
+                "detalle": (
+                    "La liquidación aplica base 360 en algunas facturas y base 365 en otras, "
+                    "lo que constituye un criterio inconsistente. Cualquier base que se use "
+                    "debe aplicarse uniformemente a toda la liquidación."
+                ),
+            })
+        elif bases_usadas == {360} and declara_360:
+            alertas.append({
+                "nivel": "verde",
+                "titulo": "✓ Base de días: 360 días declarada y aplicada consistentemente",
+                "detalle": (
+                    "La liquidación declara expresamente el uso de base 360 días y lo aplica "
+                    "de forma consistente en todas las filas. Criterio aceptable."
+                ),
+            })
+        elif bases_usadas == {365}:
+            alertas.append({
+                "nivel": "verde",
+                "titulo": "✓ Base de días: 365 días aplicada consistentemente (Art. 11 Ley 18.010)",
+                "detalle": "La liquidación aplica base 365 días en todas las filas. Correcto.",
+            })
+
     return alertas
 
 
@@ -739,6 +854,220 @@ Abogado Patrocinante
 
 
 # ─────────────────────────────────────────────
+#  ANÁLISIS DE SENTENCIA
+# ─────────────────────────────────────────────
+
+def extraer_texto_pdf(file_bytes: bytes) -> str:
+    """Extrae todo el texto de un PDF."""
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        return "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+
+def analizar_sentencia(texto_sentencia: str, texto_liquidacion: str, df_raw: pd.DataFrame) -> list[dict]:
+    """
+    Analiza el texto de la sentencia y lo compara con la liquidación.
+    Busca: fecha de inicio de intereses, tipo de interés, capital ordenado,
+    mención de costas, comisiones u otras partidas.
+    Retorna lista de alertas.
+    """
+    alertas = []
+    txt_s = texto_sentencia.lower()
+    txt_l = texto_liquidacion.lower()
+
+    # ── 1. FECHA DE INICIO DE INTERESES ──
+    # Patrones comunes en sentencias chilenas
+    patrones_fecha_interes = [
+        r"intereses?\s+(?:a contar|desde|a partir)\s+(?:del?\s+)?(?:día\s+)?(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+        r"(?:a contar|desde|a partir)\s+(?:del?\s+)?(?:día\s+)?(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})[,\s]+(?:con\s+)?(?:los?\s+)?intereses?",
+        r"intereses?\s+(?:legales?|corrientes?|moratorios?).*?(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+        r"(?:notificaci[oó]n|presentaci[oó]n|mora|vencimiento)\s+.*?(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+        r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}).*?(?:fecha\s+de\s+)?(?:mora|vencimiento|notificaci[oó]n)",
+    ]
+
+    fecha_sentencia = None
+    contexto_fecha  = ""
+    for patron in patrones_fecha_interes:
+        m = re.search(patron, txt_s)
+        if m:
+            fecha_sentencia = m.group(1)
+            # Obtener contexto (50 chars antes y después)
+            start = max(0, m.start() - 60)
+            end   = min(len(txt_s), m.end() + 60)
+            contexto_fecha = texto_sentencia[start:end].strip().replace("\n", " ")
+            break
+
+    # Buscar también frases sin fecha explícita
+    frases_inicio = []
+    for frase in [
+        "desde la mora", "desde la notificación", "desde la presentación",
+        "desde que se hizo exigible", "desde el vencimiento",
+        "desde que quedó ejecutoriada", "desde la fecha de la sentencia",
+        "desde la fecha del contrato",
+    ]:
+        if frase in txt_s:
+            frases_inicio.append(frase)
+
+    if fecha_sentencia:
+        # Buscar esa fecha en la liquidación
+        fecha_norm = fecha_sentencia.replace("-", "/")
+        if fecha_norm in texto_liquidacion:
+            alertas.append({
+                "nivel": "verde",
+                "titulo": "✓ Fecha de inicio de intereses — coincide con la sentencia",
+                "detalle": f"La sentencia ordena intereses desde {fecha_sentencia} y la liquidación usa esa misma fecha.",
+            })
+        else:
+            # Buscar fechas en la liquidación para comparar
+            fechas_liq = re.findall(r"\d{2}/\d{2}/\d{4}", texto_liquidacion)
+            fechas_str = ", ".join(sorted(set(fechas_liq))[:5]) if fechas_liq else "no detectadas"
+            alertas.append({
+                "nivel": "roja",
+                "titulo": "🚨 Fecha de inicio de intereses — no coincide con la sentencia",
+                "detalle": (
+                    f"La sentencia ordena intereses desde {fecha_sentencia} "
+                    f"(contexto: '…{contexto_fecha}…'). "
+                    f"Las fechas encontradas en la liquidación son: {fechas_str}. "
+                    f"Verifique cuál usa la liquidación como fecha de inicio."
+                ),
+            })
+    elif frases_inicio:
+        alertas.append({
+            "nivel": "amarilla",
+            "titulo": "Fecha de inicio de intereses — detectada por referencia, no por fecha exacta",
+            "detalle": (
+                f"La sentencia ordena intereses '{frases_inicio[0]}', sin indicar una fecha exacta. "
+                f"Verifique que la liquidación haya calculado correctamente ese momento inicial."
+            ),
+        })
+    else:
+        alertas.append({
+            "nivel": "amarilla",
+            "titulo": "Fecha de inicio de intereses — no detectada en la sentencia",
+            "detalle": (
+                "No se encontró una referencia clara a la fecha de inicio de los intereses "
+                "en el texto de la sentencia. Verifique manualmente el párrafo resolutivo."
+            ),
+        })
+
+    # ── 2. TIPO DE INTERÉS ORDENADO ──
+    tipo_interes_sentencia = None
+    if any(p in txt_s for p in ["interés máximo convencional", "interes maximo convencional", "tasa máxima"]):
+        tipo_interes_sentencia = "máximo convencional"
+    elif any(p in txt_s for p in ["interés corriente", "interes corriente", "tasa corriente"]):
+        tipo_interes_sentencia = "corriente"
+    elif any(p in txt_s for p in ["interés penal", "interes penal", "interés pactado", "interes pactado"]):
+        tipo_interes_sentencia = "penal pactado"
+    elif any(p in txt_s for p in ["interés legal", "interes legal"]):
+        tipo_interes_sentencia = "legal"
+
+    if tipo_interes_sentencia:
+        # Verificar que la liquidación use ese tipo
+        tipo_en_liq = any(tipo_interes_sentencia.split()[0] in txt_l for _ in [1])
+        if tipo_en_liq:
+            alertas.append({
+                "nivel": "verde",
+                "titulo": f"✓ Tipo de interés — la liquidación aplica '{tipo_interes_sentencia}' conforme a la sentencia",
+                "detalle": f"La sentencia ordenó interés {tipo_interes_sentencia} y la liquidación lo refleja.",
+            })
+        else:
+            alertas.append({
+                "nivel": "amarilla",
+                "titulo": f"Tipo de interés — sentencia ordena '{tipo_interes_sentencia}', verificar en liquidación",
+                "detalle": (
+                    f"La sentencia ordena aplicar interés {tipo_interes_sentencia}. "
+                    f"Verifique que la tasa CMF usada corresponda a ese tipo de operación."
+                ),
+            })
+
+    # ── 3. CAPITAL ORDENADO ──
+    # Buscar montos en la sentencia
+    montos_sentencia = re.findall(
+        r"\$\s*([\d]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)",
+        texto_sentencia
+    )
+    if montos_sentencia and not df_raw.empty:
+        capital_liq = df_raw["capital"].sum() if "capital" in df_raw.columns else 0
+        for monto_str in montos_sentencia:
+            monto = limpiar_numero(monto_str)
+            if monto > 100000:  # filtrar montos relevantes
+                diff = abs(monto - capital_liq)
+                if diff / max(monto, 1) < 0.05:  # coincide dentro del 5%
+                    alertas.append({
+                        "nivel": "verde",
+                        "titulo": "✓ Capital — coincide con el monto de la sentencia",
+                        "detalle": f"El capital de la sentencia (${fmt_clp(monto)}) coincide con el capital de la liquidación (${fmt_clp(capital_liq)}).",
+                    })
+                    break
+                elif diff / max(monto, 1) > 0.10:
+                    alertas.append({
+                        "nivel": "amarilla",
+                        "titulo": "Capital — diferencia entre sentencia y liquidación",
+                        "detalle": (
+                            f"La sentencia menciona un monto de ${fmt_clp(monto)} "
+                            f"y el capital en la liquidación es ${fmt_clp(capital_liq)}. "
+                            f"Si hay consignaciones parciales la diferencia puede ser correcta — verifique."
+                        ),
+                    })
+                    break
+
+    # ── 4. COSTAS ──
+    ordena_costas = any(p in txt_s for p in [
+        "con costas", "en costas", "condena en costas", "pago de costas",
+    ])
+    sin_costas = any(p in txt_s for p in [
+        "sin costas", "cada parte pagará", "no se condena en costas",
+    ])
+    costas_en_liq = any(p in txt_l for p in ["costa", "honorario"])
+
+    if sin_costas and costas_en_liq:
+        alertas.append({
+            "nivel": "roja",
+            "titulo": "🚨 Costas — la sentencia no las ordenó pero la liquidación las incluye",
+            "detalle": (
+                "La sentencia resolvió sin costas o sin condena en costas, "
+                "sin embargo la liquidación incluye un ítem de costas. "
+                "Esta partida es improcedente y debe eliminarse."
+            ),
+        })
+    elif ordena_costas and not costas_en_liq:
+        alertas.append({
+            "nivel": "amarilla",
+            "titulo": "Costas — la sentencia las ordenó pero no aparecen en la liquidación",
+            "detalle": (
+                "La sentencia condenó en costas pero no se detecta ese ítem en la liquidación. "
+                "Puede que estén pendientes de tasación, lo que es correcto si aún no se han tasado."
+            ),
+        })
+    elif ordena_costas and costas_en_liq:
+        alertas.append({
+            "nivel": "verde",
+            "titulo": "✓ Costas — la sentencia las ordenó y están incluidas en la liquidación",
+            "detalle": "Verifique que exista resolución de tasación aprobada y ejecutoriada.",
+        })
+
+    # ── 5. PARTIDAS ADICIONALES NO ORDENADAS ──
+    # Buscar comisiones en sentencia
+    ordena_comision = any(p in txt_s for p in [
+        "comisión", "comision", "cargo fijo", "cargo adicional",
+    ])
+    comision_en_liq = any(p in txt_l for p in [
+        "comisión fija", "comision fija", "cargo fijo",
+    ])
+
+    if comision_en_liq and not ordena_comision:
+        alertas.append({
+            "nivel": "roja",
+            "titulo": "🚨 Comisión — no ordenada en sentencia pero incluida en liquidación",
+            "detalle": (
+                "La liquidación incluye una comisión que no fue ordenada en la sentencia. "
+                "Esta partida es improcedente al no tener respaldo en el título ejecutivo ni en la sentencia."
+            ),
+        })
+
+    return alertas
+
+
+# ─────────────────────────────────────────────
 #  RENDER DE ALERTAS
 # ─────────────────────────────────────────────
 
@@ -746,7 +1075,12 @@ def render_alerta(alerta: dict):
     nivel   = alerta["nivel"]
     titulo  = alerta["titulo"]
     detalle = alerta["detalle"]
-    css_cls = {"roja": "alerta-roja", "amarilla": "alerta-amarilla", "verde": "alerta-verde"}.get(nivel, "alerta-azul")
+    css_cls = {
+        "roja":     "alerta-roja",
+        "amarilla": "alerta-amarilla",
+        "verde":    "alerta-verde",
+        "azul":     "alerta-azul",
+    }.get(nivel, "alerta-azul")
     st.markdown(
         f'<div class="{css_cls}"><strong>{titulo}</strong><br>{detalle}</div>',
         unsafe_allow_html=True,
@@ -758,36 +1092,27 @@ def render_alerta(alerta: dict):
 # ─────────────────────────────────────────────
 
 if uploaded_file is None:
-    # Pantalla de bienvenida
-    st.markdown('<div class="alerta-azul">👈 Cargue un PDF de liquidación en la barra lateral para comenzar la auditoría.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="alerta-azul">👈 Cargue un PDF de liquidación en la barra lateral para comenzar. La sentencia es opcional — si la sube, se activa la verificación legal.</div>', unsafe_allow_html=True)
 
-    with st.expander("¿Qué errores detecta esta herramienta?", expanded=True):
+    with st.expander("¿Qué audita esta herramienta?", expanded=True):
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("""
-**1. Base de cálculo 360 vs 365 días**
-El Art. 11 de la Ley 18.010 exige 365 días.
-Usar 360 genera ~1.39% de exceso en todos los intereses.
-
-**2. Tasa variable CMF**
-La CMF publica tasa nueva el día 15 de cada mes.
-Aplicar una tasa fija a períodos largos es incorrecto.
-
-**3. Comisión Fija Única sobre base incorrecta**
-Detecta si el saldo insoluto usado para calcular la
-comisión corresponde a deuda anterior ya consignada.
+**Solo con la liquidación:**
+1. Base de días (360 vs 365) — consistencia y declaración expresa
+2. Errores aritméticos por factura
+3. Comisión Fija Única sobre base incorrecta
+4. Tasa variable CMF en períodos largos
+5. Anatocismo (interés sobre interés)
 """)
         with col2:
             st.markdown("""
-**4. Errores aritméticos**
-Verifica que Interés = Capital × Días × (Tasa / base).
-
-**5. Anatocismo**
-Detecta si se calculan intereses sobre intereses
-(Art. 9, Ley 18.010).
-
-**6. Partidas no sentenciadas**
-Comisiones u otros ítems sin respaldo en sentencia.
+**Agregando la sentencia (opcional):**
+6. Fecha de inicio de intereses — ¿coincide con lo ordenado?
+7. Tipo de interés — ¿corriente, máximo o penal?
+8. Capital base — ¿coincide con el fijado en sentencia?
+9. Costas — ¿fueron ordenadas? ¿están tasadas?
+10. Partidas no sentenciadas (comisiones, cargos)
 """)
     st.stop()
 
@@ -810,7 +1135,25 @@ c3.markdown(f"**Tribunal:** {meta.get('tribunal', 'No detectado')}")
 if meta.get("caratula"):
     st.markdown(f"**Carátula:** {meta.get('caratula')}")
 
-# ── Verificar extracción ──
+# ── Detectar base automáticamente desde el texto ──
+texto_lower = texto_pdf.lower()
+if any(p in texto_lower for p in ["dividida por 360","dividido por 360","360 días","360 dias","base 360"]):
+    base_liquidacion = 360
+elif any(p in texto_lower for p in ["dividida por 365","dividido por 365","365 días","365 dias","base 365"]):
+    base_liquidacion = 365
+else:
+    # Intentar detectar por los cálculos reales si hay datos
+    if not df_raw.empty and "capital" in df_raw.columns:
+        votos_360 = votos_365 = 0
+        for _, row in df_raw.iterrows():
+            cap = row.get("capital",0); dias = row.get("dias",0)
+            tasa = row.get("tasa",0);   int_liq = row.get("interes_liq",0)
+            if cap<=0 or dias<=0 or tasa<=0 or int_liq<=0: continue
+            tol = int_liq * 0.01
+            if abs(calcular_interes(cap,dias,tasa,360) - int_liq) <= tol: votos_360 += 1
+            if abs(calcular_interes(cap,dias,tasa,365) - int_liq) <= tol: votos_365 += 1
+        base_liquidacion = 360 if votos_360 >= votos_365 else 365
+    # si no hay datos, queda el default 360
 if df_raw.empty:
     st.markdown("""
 <div class="alerta-amarilla">
@@ -865,9 +1208,26 @@ st.dataframe(df_display, use_container_width=True, hide_index=True)
 st.markdown('<div class="seccion-titulo">Re-cálculo del auditor (base 365 días)</div>', unsafe_allow_html=True)
 
 df_auditado, alertas_calc = auditar(df_raw, base_liquidacion)
-alertas_base  = auditar_base_dias(df_raw, base_liquidacion)
+alertas_base  = auditar_base_dias(df_raw, base_liquidacion, texto_pdf)
 alertas_com   = auditar_comision(df_raw, texto_pdf)
-todas_alertas = alertas_base + alertas_com + alertas_calc
+
+# ── Analizar sentencia si fue subida ──
+alertas_sentencia = []
+texto_sentencia   = ""
+if uploaded_sentencia:
+    with st.spinner("Analizando sentencia..."):
+        sentencia_bytes = uploaded_sentencia.read()
+        texto_sentencia = extraer_texto_pdf(sentencia_bytes)
+        if texto_sentencia.strip():
+            alertas_sentencia = analizar_sentencia(texto_sentencia, texto_pdf, df_raw)
+        else:
+            st.markdown(
+                '<div class="alerta-amarilla">No se pudo extraer texto de la sentencia. '
+                'Verifique que el PDF no sea una imagen escaneada.</div>',
+                unsafe_allow_html=True,
+            )
+
+todas_alertas = alertas_base + alertas_com + alertas_calc + alertas_sentencia
 
 # Colorear tabla auditada
 def colorear_fila(row):
@@ -911,6 +1271,15 @@ if not df_auditado.empty:
         st.metric("Exceso cobrado", fmt_clp(abs(diff_total)), delta=f"{diff_total/total_corr*100:.2f}%" if total_corr else "—", delta_color=color)
     with mc4:
         st.metric("Alertas rojas", str(n_errores), delta="errores críticos", delta_color="inverse" if n_errores > 0 else "normal")
+
+# ── Panel de análisis de sentencia ──
+if uploaded_sentencia and alertas_sentencia:
+    st.markdown('<div class="seccion-titulo">Verificación legal — contraste con la sentencia</div>', unsafe_allow_html=True)
+    for a in alertas_sentencia:
+        render_alerta(a)
+elif uploaded_sentencia:
+    st.markdown('<div class="seccion-titulo">Verificación legal — contraste con la sentencia</div>', unsafe_allow_html=True)
+    st.markdown('<div class="alerta-azul">No se detectaron discrepancias entre la sentencia y la liquidación en los puntos analizados.</div>', unsafe_allow_html=True)
 
 # ── Panel de discrepancias ──
 st.markdown('<div class="seccion-titulo">Panel de discrepancias detectadas</div>', unsafe_allow_html=True)
