@@ -324,24 +324,155 @@ def extraer_tabla_estrategia2(pdf) -> list[list]:
 
 def limpiar_monto_pdf(texto: str) -> float:
     """
-    Limpia montos con espacios internos y $ al final.
-    Ej: '7 76.475 $' → 776475.0
-        '1 .244.145 $' → 1244145.0
-        '9 8.768 $' → 98768.0
+    Limpia montos con espacios internos típicos de PDFs del PJUD.
+    Ejemplos reales:
+      '$ 7 76.475'  → 776475.0
+      '$ 1 .244.145'→ 1244145.0
+      '$ 9 8.768'   → 98768.0
+      '$ 3 .903.200'→ 3903200.0
+      '$ 1.812'     → 1812.0
     """
     if not texto:
         return 0.0
-    # Quitar $ y espacios, luego unir dígitos separados por espacio
-    s = str(texto).replace("$", "").strip()
-    # Unir números separados por espacios (ej: "7 76.475" → "776.475")
+    s = str(texto).strip()
+    # Quitar signo $ y paréntesis
+    s = s.replace("$", "").replace("(", "").replace(")", "").strip()
+    # Unir todos los fragmentos separados por espacios
+    # Ej: "7 76.475" → "776.475", "1 .244.145" → "1.244.145"
     partes = s.split()
     s = "".join(partes)
-    # Ahora limpiar puntos de miles y comas decimales
-    s = s.replace(".", "").replace(",", ".")
+    # Ahora tenemos algo como "776.475" o "1.244.145" o "3.903.200"
+    # En Chile: puntos = separador de miles, coma = decimal
+    # Quitar puntos de miles y convertir coma decimal si existe
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        # Sin coma: los puntos son separadores de miles
+        s = s.replace(".", "")
     try:
         return float(s)
     except ValueError:
         return 0.0
+
+
+def extraer_tabla_estrategia3(texto: str) -> list:
+    """
+    Parser calibrado para el formato real de liquidaciones del PJUD chileno.
+
+    Formato real (una línea por factura, montos con espacios internos):
+    178039 24/12/2022 $ 7 76.475 28/07/2023 216 21,20% 0,0589% $ 98.768 ($ 7 76.475) ...
+    saldo 178039 29/07/2023 $ 9 8.768 27/05/2025 668 21,92% 0,0609% $ 40.173
+
+    Estrategia: buscar número de factura + fecha + reconstruir monto
+    ignorando los espacios internos de los valores.
+    """
+    # Patrón para línea principal:
+    # NNNNN  DD/MM/AAAA  [$ fragmentos]  DD/MM/AAAA  DIAS  TASA%  FACTOR%  $ INTERES
+    patron_p = re.compile(
+        r"^(\d{5,7})\s+"                           # N° factura
+        r"(\d{1,2}/\d{1,2}/\d{4})\s+"             # fecha mora
+        r"\$\s*([\d\s.,]+?)\s+"                    # capital (con espacios internos)
+        r"(\d{1,2}/\d{1,2}/\d{4})\s+"             # fecha consignación
+        r"(\d{2,4})\s+"                             # días mora
+        r"([\d.,]+)\s*%\s+"                         # tasa anual
+        r"([\d.,]+)\s*%\s+"                         # factor diario
+        r"\$\s*([\d\s.,]+)"                         # interés acumulado
+    )
+
+    # Patrón para línea de saldo:
+    # saldo NNNNN  DD/MM/AAAA  [$ fragmentos]  DD/MM/AAAA  DIAS  TASA%  FACTOR%  $ INTERES
+    patron_s = re.compile(
+        r"^saldo\s+(\d{5,7})\s+"                   # saldo + N° factura
+        r"(\d{1,2}/\d{1,2}/\d{4})\s+"             # fecha inicio saldo
+        r"\$\s*([\d\s.,]+?)\s+"                    # capital saldo
+        r"(\d{1,2}/\d{1,2}/\d{4})\s+"             # fecha fin saldo
+        r"(\d{2,4})\s+"                             # días saldo
+        r"([\d.,]+)\s*%\s+"                         # tasa saldo
+        r"([\d.,]+)\s*%\s+"                         # factor saldo
+        r"\$\s*([\d\s.,]+)"                         # interés saldo
+        , re.IGNORECASE
+    )
+
+    principales = {}
+    saldos      = {}
+
+    for linea in texto.split("\n"):
+        linea = linea.strip()
+        if not linea:
+            continue
+
+        # ── Intentar fila principal ──
+        m = patron_p.match(linea)
+        if m:
+            num     = m.group(1)
+            capital = limpiar_monto_pdf(m.group(3))
+            dias    = int(m.group(5))
+            tasa_s  = m.group(6).replace(",",".")
+            interes = limpiar_monto_pdf(m.group(8))
+            try:
+                tasa = float(tasa_s)
+            except ValueError:
+                tasa = 0.0
+
+            if capital > 0 and dias > 0:
+                principales[num] = {
+                    "numero":        num,
+                    "fecha_mora":    m.group(2),
+                    "capital":       capital,
+                    "fecha_liq":     m.group(4),
+                    "dias":          dias,
+                    "tasa":          tasa,
+                    "factor_dia":    0.0,
+                    "interes_liq":   interes,
+                    "consig":        0.0,
+                    "capital_am":    0.0,
+                    "dias_p1":       dias,
+                    "tasa_p1":       tasa,
+                    "interes_p1":    interes,
+                    "tiene_saldo":   False,
+                    "saldo_capital": 0.0,
+                    "dias_p2":       0,
+                    "tasa_p2":       0.0,
+                    "interes_p2":    0.0,
+                }
+            continue
+
+        # ── Intentar fila de saldo ──
+        ms = patron_s.match(linea)
+        if ms:
+            num       = ms.group(1)
+            sal_cap   = limpiar_monto_pdf(ms.group(3))
+            dias2     = int(ms.group(5))
+            tasa2_s   = ms.group(6).replace(",",".")
+            interes2  = limpiar_monto_pdf(ms.group(8))
+            try:
+                tasa2 = float(tasa2_s)
+            except ValueError:
+                tasa2 = 0.0
+
+            saldos[num] = {
+                "saldo_capital": sal_cap,
+                "dias_p2":       dias2,
+                "tasa_p2":       tasa2,
+                "interes_p2":    interes2,
+            }
+
+    if not principales:
+        return []
+
+    # Combinar principal + saldo
+    resultado = []
+    for num, p in principales.items():
+        s = saldos.get(num, {})
+        if s:
+            p["tiene_saldo"]   = True
+            p["saldo_capital"] = s["saldo_capital"]
+            p["dias_p2"]       = s["dias_p2"]
+            p["tasa_p2"]       = s["tasa_p2"]
+            p["interes_p2"]    = s["interes_p2"]
+        resultado.append(p)
+
+    return resultado
 
 
 def extraer_tabla_estrategia3(texto: str) -> list:
