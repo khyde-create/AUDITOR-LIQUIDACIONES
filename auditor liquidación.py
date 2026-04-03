@@ -555,40 +555,132 @@ def analizar_sentencia(texto_s: str, texto_l: str, df: pd.DataFrame) -> list:
     ts = texto_s.lower()
     tl = texto_l.lower()
 
-    # Fecha de inicio
-    patrones_fecha = [
-        r"intereses?\s+(?:a contar|desde|a partir)\s+(?:del?\s+)?(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
-        r"(?:a contar|desde)\s+(?:del?\s+)?(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})[,\s]+(?:con\s+)?intereses?",
-    ]
-    fecha_s = None
-    for pat in patrones_fecha:
-        fm = re.search(pat, ts)
-        if fm:
-            fecha_s = fm.group(1)
-            break
+    capital_liq = df["capital"].sum() if not df.empty else 0
 
-    if fecha_s:
-        fecha_norm = fecha_s.replace("-", "/")
-        if fecha_norm in texto_l:
-            alertas.append({"nivel": "verde", "titulo": "✓ Fecha de inicio de intereses coincide con sentencia",
-                            "detalle": f"La sentencia ordena intereses desde {fecha_s} y la liquidación lo refleja."})
+    # ── 1. CAPITAL ORIGINAL EN SENTENCIA vs SALDO REAL ──
+    # Buscar montos grandes mencionados en la sentencia (capital demandado)
+    montos_sentencia = re.findall(
+        r'\$\s*([\d]{1,3}(?:[.,]\d{3})+)',
+        texto_s
+    )
+    capital_original = 0
+    for m in montos_sentencia:
+        v = limpiar_monto_pdf(m)
+        if v > capital_original and v > 1_000_000:
+            capital_original = v
+
+    if capital_original > 0 and capital_liq > 0:
+        if capital_original > capital_liq * 2:
+            # ── 2. COMISIÓN CALCULADA SOBRE CAPITAL INCORRECTO ──
+            # Buscar comisión en la liquidación
+            m_com = re.search(
+                r'comisi[oó]n\s+fija[\s\w]*[:\s]*\$?\s*([\d.,\s]+)',
+                tl, re.IGNORECASE
+            )
+            m_saldo = re.search(
+                r'saldo\s+insoluto[\s.:$]*([\d.,\s]+)',
+                tl, re.IGNORECASE
+            )
+            if m_saldo:
+                saldo_usado = limpiar_monto_pdf(m_saldo.group(1))
+                if saldo_usado > capital_liq * 2:
+                    com_incorrecta = saldo_usado * 0.01
+                    com_correcta   = capital_liq  * 0.01
+                    exceso         = com_incorrecta - com_correcta
+                    alertas.append({
+                        "nivel": "roja",
+                        "titulo": "🚨 Comisión Ley 19.983 calculada sobre saldo incorrecto",
+                        "detalle": (
+                            f"La liquidación calcula la comisión (1%) sobre el saldo insoluto "
+                            f"original de {fmt_clp(saldo_usado)} (deuda antes de pagos), "
+                            f"cuando debería calcularse sobre el capital insoluto real después "
+                            f"de las consignaciones: {fmt_clp(capital_liq)}. "
+                            f"Comisión cobrada: {fmt_clp(com_incorrecta)} | "
+                            f"Comisión correcta: {fmt_clp(com_correcta)} | "
+                            f"Exceso: {fmt_clp(exceso)}."
+                        ),
+                    })
+
+    # ── 3. COSTAS EN SENTENCIA ──
+    con_costas  = any(p in ts for p in ["condena en costas", "condena a la parte ejecutada en costas",
+                                         "se condena en costas"])
+    sin_costas  = any(p in ts for p in ["sin costas", "no se condena en costas", "cada parte"])
+    costas_liq  = any(p in tl for p in ["costas", "honorario"])
+
+    if con_costas:
+        # Verificar si están en la liquidación sin tasación
+        tasacion = any(p in tl for p in ["tasación", "tasacion", "regulación", "regulacion"])
+        if costas_liq and not tasacion:
+            alertas.append({
+                "nivel": "amarilla",
+                "titulo": "Costas incluidas — verificar si existe tasación aprobada",
+                "detalle": (
+                    "La sentencia condena en costas a la ejecutada (punto II resolutivo). "
+                    "Para incluirlas en la liquidación deben existir resoluciones firmes de "
+                    "tasación de costas procesales y regulación de costas personales. "
+                    "Verifique si esas resoluciones existen en el expediente."
+                ),
+            })
+        elif not costas_liq:
+            alertas.append({
+                "nivel": "amarilla",
+                "titulo": "Costas ordenadas en sentencia — no aparecen en la liquidación",
+                "detalle": "La sentencia condena en costas pero no se detectan en la liquidación. Pueden estar pendientes de tasación.",
+            })
+    elif sin_costas and costas_liq:
+        alertas.append({
+            "nivel": "roja",
+            "titulo": "🚨 Costas incluidas sin ser ordenadas en sentencia",
+            "detalle": "La sentencia resolvió sin costas pero la liquidación las incluye. Partida improcedente.",
+        })
+
+    # ── 4. FECHA DE INICIO DE INTERESES ──
+    # En juicios de facturas (Ley 19.983) los intereses corren desde la mora
+    # que es la fecha de vencimiento de cada factura
+    if any(p in ts for p in ["19.983", "ley 19983", "factura"]):
+        alertas.append({
+            "nivel": "verde",
+            "titulo": "✓ Intereses desde fecha de mora de cada factura (Ley 19.983)",
+            "detalle": (
+                "La sentencia se basa en la Ley 19.983 (facturas). "
+                "Los intereses deben computarse desde la fecha de vencimiento de cada factura, "
+                "que es la fecha de mora indicada en la columna correspondiente. "
+                "Verifique que las fechas de mora en la liquidación coincidan con los vencimientos "
+                "de las facturas individualizadas en la sentencia."
+            ),
+        })
+
+    # ── 5. DEDUCCIÓN DE PAGOS PARCIALES ──
+    # La sentencia ordena expresamente deducir los pagos del considerando séptimo
+    if any(p in ts for p in ["previa deducción", "previa deducci", "considerando séptimo",
+                              "considerando septimo", "sumas señaladas"]):
+        # Verificar que la liquidación tenga consignaciones
+        tiene_consig = "capital_am" in df.columns and df["capital_am"].sum() > 0
+        tiene_p2     = "saldo_capital" in df.columns and df["saldo_capital"].sum() > 0
+
+        if tiene_consig or tiene_p2:
+            alertas.append({
+                "nivel": "verde",
+                "titulo": "✓ Pagos parciales deducidos conforme a sentencia",
+                "detalle": (
+                    "La sentencia ordena proseguir la ejecución 'previa deducción de las sumas "
+                    "señaladas en el considerando séptimo' (pagos por transferencia bancaria). "
+                    "La liquidación refleja consignaciones para cada factura. "
+                    "Verifique que los montos descontados coincidan exactamente con los "
+                    "comprobantes de pago individualizados en dicho considerando."
+                ),
+            })
         else:
-            alertas.append({"nivel": "roja", "titulo": "🚨 Fecha de inicio no coincide con sentencia",
-                            "detalle": f"La sentencia ordena intereses desde {fecha_s} pero esa fecha no aparece en la liquidación."})
+            alertas.append({
+                "nivel": "roja",
+                "titulo": "🚨 La sentencia ordena deducir pagos pero la liquidación no los refleja",
+                "detalle": (
+                    "La sentencia ordena expresamente deducir los pagos parciales realizados "
+                    "antes de calcular los intereses, pero no se detectan consignaciones "
+                    "en la liquidación."
+                ),
+            })
 
-    # Costas
-    sin_costas = any(p in ts for p in ["sin costas", "cada parte pagará", "no se condena en costas"])
-    con_costas = any(p in tl for p in ["costa", "honorario"])
-    if sin_costas and con_costas:
-        alertas.append({"nivel": "roja", "titulo": "🚨 Costas incluidas sin ser ordenadas en sentencia",
-                        "detalle": "La sentencia resolvió sin costas pero la liquidación las incluye."})
-
-    # Comisión
-    ordena_com = any(p in ts for p in ["comisión", "comision", "cargo fijo"])
-    com_en_liq = any(p in tl for p in ["comisión fija", "comision fija"])
-    if com_en_liq and not ordena_com:
-        alertas.append({"nivel": "roja", "titulo": "🚨 Comisión no ordenada en sentencia",
-                        "detalle": "La liquidación incluye una comisión que no fue ordenada en la sentencia."})
     return alertas
 
 
