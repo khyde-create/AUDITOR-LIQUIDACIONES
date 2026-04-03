@@ -374,6 +374,25 @@ def limpiar_monto_pdf(texto: str) -> float:
         return 0.0
 
 
+def normalizar_texto_liquidacion(texto: str) -> str:
+    """
+    Normaliza texto pegado desde PDF del PJUD.
+    Si llegó todo en una sola línea (sin saltos), reconstruye los saltos
+    insertando \\n antes de cada número de factura y cada 'saldo NNNNN'.
+    """
+    lineas_validas = [l for l in texto.split("\n") if l.strip()]
+    # Si ya hay suficientes líneas, no hace falta normalizar
+    if len(lineas_validas) > 10:
+        return texto
+    # Texto comprimido en pocas líneas — reconstruir saltos
+    t = re.sub(r"  +", " ", texto)
+    # Insertar \n antes de "saldo NNNNN"
+    t = re.sub(r"(?i)\s(saldo\s+\d{5,7})\s", r"\n\1 ", t)
+    # Insertar \n antes de número de factura seguido de fecha
+    t = re.sub(r"\s(\d{5,7})\s+(\d{1,2}/\d{1,2}/\d{4})", r"\n\1 \2", t)
+    return t
+
+
 def extraer_tabla_estrategia3(texto: str) -> list:
     """
     Parser calibrado para el formato real de liquidaciones del PJUD chileno.
@@ -385,6 +404,8 @@ def extraer_tabla_estrategia3(texto: str) -> list:
     Estrategia: buscar número de factura + fecha + reconstruir monto
     ignorando los espacios internos de los valores.
     """
+    # Normalizar primero — maneja texto pegado sin saltos de línea
+    texto = normalizar_texto_liquidacion(texto)
     # Patrón para línea principal:
     # NNNNN  DD/MM/AAAA  [$ fragmentos]  DD/MM/AAAA  DIAS  TASA%  FACTOR%  $ INTERES
     patron_p = re.compile(
@@ -1469,7 +1490,7 @@ df_raw = pd.DataFrame()
 
 if texto_pegado_sidebar.strip():
     # Modo texto pegado
-    texto_pdf = texto_pegado_sidebar
+    texto_pdf = normalizar_texto_liquidacion(texto_pegado_sidebar)
     meta = extraer_meta(texto_pdf)
     with st.spinner("Procesando texto..."):
         filas = extraer_tabla_estrategia3(texto_pdf)
