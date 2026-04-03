@@ -1243,24 +1243,32 @@ def colorear_fila(row):
     return [""] * len(row)
 
 cols_fmt = {
-    "Capital ($)":              "{:,.0f}",
-    "Interés liquidado ($)":    "{:,.0f}",
-    "Interés correcto 365 ($)": "{:,.0f}",
-    "Diferencia ($)":           "{:,.0f}",
+    "Capital ($)":           "{:,.0f}",
+    "Interés liquidado ($)": "{:,.0f}",
+    "Diferencia ($)":        "{:,.0f}",
 }
+# Agregar columnas numéricas dinámicas al formato
+for col in df_auditado.columns:
+    if "base" in col.lower() or "365d" in col.lower() or "correcto" in col.lower():
+        cols_fmt[col] = "{:,.0f}"
 
 if not df_auditado.empty:
     df_styled = (
         df_auditado.style
         .apply(colorear_fila, axis=1)
-        .format(cols_fmt)
+        .format({k: v for k, v in cols_fmt.items() if k in df_auditado.columns})
     )
     st.dataframe(df_styled, use_container_width=True, hide_index=True)
 
 # ── Métricas resumen ──
 if not df_auditado.empty:
     total_liq  = df_auditado["Interés liquidado ($)"].sum()
-    total_corr = df_auditado["Interés correcto 365 ($)"].sum()
+    # Buscar columna de referencia con nombre dinámico
+    col_ref = next(
+        (c for c in df_auditado.columns if "base" in c.lower() or "365d" in c.lower() or "correcto" in c.lower()),
+        None
+    )
+    total_corr = df_auditado[col_ref].sum() if col_ref else total_liq
     diff_total = total_liq - total_corr
     n_errores  = len([a for a in todas_alertas if a["nivel"] == "roja"])
 
@@ -1270,7 +1278,8 @@ if not df_auditado.empty:
     with mc1:
         st.metric("Intereses liquidados", fmt_clp(total_liq))
     with mc2:
-        st.metric("Intereses correctos (365d)", fmt_clp(total_corr))
+        label_ref = col_ref if col_ref else "Interés referencia"
+        st.metric(label_ref, fmt_clp(total_corr))
     with mc3:
         color = "normal" if diff_total <= 0 else "inverse"
         st.metric("Exceso cobrado", fmt_clp(abs(diff_total)), delta=f"{diff_total/total_corr*100:.2f}%" if total_corr else "—", delta_color=color)
