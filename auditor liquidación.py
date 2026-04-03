@@ -160,12 +160,31 @@ st.markdown("""
 #  BARRA LATERAL
 # ─────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ Configuración")
-    uploaded_file = st.file_uploader(
-        "Cargar PDF de la liquidación",
-        type=["pdf"],
-        help="Archivo descargado desde el sistema del Poder Judicial (OJV / PJUD)",
+    st.markdown("### ⚖️ Liquidación")
+
+    modo = st.radio(
+        "Modo de entrada",
+        ["📄 Subir PDF", "📋 Pegar texto"],
+        help="Si el PDF no se lee bien, use 'Pegar texto': abra el PDF, Ctrl+A, Ctrl+C, y pegue aquí.",
     )
+
+    uploaded_file = None
+    texto_pegado_sidebar = ""
+
+    if modo == "📄 Subir PDF":
+        uploaded_file = st.file_uploader(
+            "Cargar PDF de la liquidación",
+            type=["pdf"],
+            help="Archivo descargado desde PJUD",
+        )
+    else:
+        texto_pegado_sidebar = st.text_area(
+            "Pegue el texto del PDF aquí",
+            height=250,
+            placeholder="Abra el PDF → Ctrl+A → Ctrl+C → Ctrl+V aquí",
+            key="sidebar_texto",
+        )
+        st.caption("Seleccione todo el texto del PDF y péguelo. La herramienta lo parsea automáticamente.")
 
     st.markdown("---")
     st.markdown("### 📄 Sentencia (opcional)")
@@ -1419,9 +1438,8 @@ def render_alerta(alerta: dict):
 #  RENDER PRINCIPAL
 # ─────────────────────────────────────────────
 
-if uploaded_file is None:
-    st.markdown('<div class="alerta-azul">👈 Cargue un PDF de liquidación en la barra lateral para comenzar. La sentencia es opcional — si la sube, se activa la verificación legal.</div>', unsafe_allow_html=True)
-
+if uploaded_file is None and not texto_pegado_sidebar.strip():
+    st.markdown('<div class="alerta-azul">👈 Suba un PDF o pegue el texto de la liquidación en la barra lateral para comenzar.</div>', unsafe_allow_html=True)
     with st.expander("¿Qué audita esta herramienta?", expanded=True):
         col1, col2 = st.columns(2)
         with col1:
@@ -1444,15 +1462,44 @@ if uploaded_file is None:
 """)
     st.stop()
 
-# ── Procesar PDF ──
-file_bytes = uploaded_file.read()
+# ── Procesar según modo ──
+meta = {}
+texto_pdf = ""
+df_raw = pd.DataFrame()
 
-with st.spinner("Extrayendo datos del PDF..."):
-    df_raw, meta = extraer_tabla_pdf(file_bytes)
+if texto_pegado_sidebar.strip():
+    # Modo texto pegado
+    texto_pdf = texto_pegado_sidebar
+    meta = extraer_meta(texto_pdf)
+    with st.spinner("Procesando texto..."):
+        filas = extraer_tabla_estrategia3(texto_pdf)
+        if not filas:
+            filas = extraer_tabla_estrategia4(texto_pdf)
+    if filas:
+        df_raw = pd.DataFrame(filas)
+        df_raw.attrs["estrategia"] = "Texto pegado directamente"
+    else:
+        st.markdown('<div class="alerta-amarilla"><strong>No se pudo parsear el texto.</strong> Verifique que copió la tabla completa incluyendo las filas de saldo.</div>', unsafe_allow_html=True)
+        st.stop()
 
-# Extraer texto completo para búsqueda de comisión
-with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-    texto_pdf = "\n".join(page.extract_text() or "" for page in pdf.pages)
+elif uploaded_file is not None:
+    # Modo PDF
+    file_bytes = uploaded_file.read()
+    with st.spinner("Extrayendo datos del PDF..."):
+        df_raw, meta = extraer_tabla_pdf(file_bytes)
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        texto_pdf = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    if df_raw.empty or len(df_raw) < 3:
+        st.markdown("""
+<div class="alerta-amarilla">
+<strong>Extracción automática limitada.</strong><br>
+Cambie a modo "Pegar texto" en la barra lateral: abra el PDF, <strong>Ctrl+A → Ctrl+C</strong>,
+y pegue el texto en el campo de la barra lateral.
+</div>
+""", unsafe_allow_html=True)
+        if df_raw.empty:
+            st.stop()
 
 # ── Metadatos ──
 st.markdown('<div class="seccion-titulo">Identificación de la causa</div>', unsafe_allow_html=True)
