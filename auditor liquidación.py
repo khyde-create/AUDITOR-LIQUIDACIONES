@@ -509,58 +509,61 @@ def extraer_tabla_pdf(file_bytes: bytes) -> tuple[pd.DataFrame, dict]:
 
 def auditar(df: pd.DataFrame, base_liq: int) -> tuple[pd.DataFrame, list[dict]]:
     """
-    Recalcula intereses con base 365 y detecta discrepancias.
-    Retorna (df_auditado, lista_alertas).
+    Recalcula intereses usando la base declarada por el tribunal.
+    Solo marca error si el número no cuadra con la base que el propio
+    tribunal declaró usar. La columna de comparación refleja esa base.
     """
     alertas = []
-    filas = []
+    filas   = []
+    col_ref = f"Interés según base {base_liq}d ($)"
 
     for _, row in df.iterrows():
-        capital   = row["capital"]
-        dias      = row["dias"]
-        tasa      = row["tasa"]
-        int_liq   = row["interes_liq"]
+        capital  = row.get("capital",  0)
+        dias     = row.get("dias",     0)
+        tasa     = row.get("tasa",     0)
+        int_liq  = row.get("interes_liq", 0)
 
-        # Cálculo con base de la liquidación (ej. 360)
-        int_base_liq  = calcular_interes(capital, dias, tasa, base_liq)
-        # Cálculo correcto (365)
-        int_correcto  = calcular_interes(capital, dias, tasa, 365)
-        # Diferencia
-        diff_base     = int_liq - int_base_liq   # vs lo calculado con la base de la liquidación
-        diff_legal    = int_liq - int_correcto    # vs lo correcto por ley
+        if capital <= 0 or dias <= 0 or tasa <= 0:
+            continue
 
-        # Verificar factor diario declarado
-        factor_decl   = row.get("factor_dia", 0.0)
-        factor_calc   = (tasa / 100.0 / base_liq) * 100  # en %
-        diff_factor   = abs(factor_decl - factor_calc)
+        # Recalcular con la base que el tribunal declaró usar
+        int_base_decl = calcular_interes(capital, dias, tasa, base_liq)
+        # También calcular con 365 para mostrarlo como referencia
+        int_365       = calcular_interes(capital, dias, tasa, 365)
+
+        # La diferencia relevante es contra la base declarada
+        diff = int_liq - int_base_decl
+        tolerancia = max(int_liq * 0.01, 10)  # 1% o $10, lo que sea mayor
 
         estado = "✓ OK"
-        if abs(diff_legal) > 50:
+        if abs(diff) > tolerancia:
             estado = "⚠ Diferencia"
-        if diff_legal > 500:
+        if abs(diff) > tolerancia * 5:
             estado = "✗ Error"
 
         filas.append({
-            "N° Factura":           row["numero"],
-            "Fecha mora":           row["fecha_mora"],
-            "Capital ($)":          capital,
-            "Días":                 dias,
-            "Tasa (%)":             tasa,
+            "N° Factura":          row.get("numero", ""),
+            "Fecha mora":          row.get("fecha_mora", ""),
+            "Capital ($)":         capital,
+            "Días":                dias,
+            "Tasa (%)":            tasa,
             "Interés liquidado ($)": int_liq,
-            f"Interés correcto 365 ($)": int_correcto,
-            "Diferencia ($)":       diff_legal,
-            "Estado":               estado,
+            col_ref:               int_base_decl,
+            "Ref. 365d ($)":       int_365,
+            "Diferencia ($)":      diff,
+            "Estado":              estado,
         })
 
-        # Alertas individuales
-        if abs(diff_legal) > 50:
+        # Solo alerta si no cuadra con la base declarada
+        if abs(diff) > tolerancia:
             alertas.append({
-                "nivel": "roja" if diff_legal > 500 else "amarilla",
-                "titulo": f"Factura {row['numero']} — Diferencia en intereses",
+                "nivel": "roja" if abs(diff) > tolerancia * 5 else "amarilla",
+                "titulo": f"Factura {row.get('numero','?')} — No cuadra con base {base_liq} días",
                 "detalle": (
-                    f"Interés liquidado: {fmt_clp(int_liq)} | "
-                    f"Correcto (365 días): {fmt_clp(int_correcto)} | "
-                    f"Exceso: {fmt_clp(diff_legal)}"
+                    f"Liquidado: {fmt_clp(int_liq)} | "
+                    f"Calculado con base {base_liq}d: {fmt_clp(int_base_decl)} | "
+                    f"Diferencia: {fmt_clp(abs(diff))} | "
+                    f"Referencia base 365d: {fmt_clp(int_365)}"
                 ),
             })
 
@@ -805,7 +808,9 @@ def generar_escrito(
         fundamentos = "".join(lines)
 
     total_liq  = df_auditado["Interés liquidado ($)"].sum()   if not df_auditado.empty else 0
-    total_corr = df_auditado["Interés correcto 365 ($)"].sum() if not df_auditado.empty else 0
+    # Buscar columna de referencia flexible
+    col_ref = next((c for c in df_auditado.columns if "según base" in c or "correcto" in c), None)
+    total_corr = df_auditado[col_ref].sum() if (col_ref and not df_auditado.empty) else total_liq
     diff_total = total_liq - total_corr
 
     escrito = f"""OBSERVACIONES A LA LIQUIDACIÓN DE CRÉDITO
