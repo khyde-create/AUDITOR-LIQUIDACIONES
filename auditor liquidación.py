@@ -324,79 +324,133 @@ def extraer_tabla_estrategia2(pdf) -> list[list]:
 
 def extraer_tabla_estrategia3(texto: str) -> list[list]:
     """
-    Estrategia 3: parseo por texto plano con regex.
-    Funciona cuando pdfplumber extrae texto pero no detecta tabla.
-    Busca líneas con patrón: número factura | fecha | monto | días | tasa%
+    Estrategia 3: parser calibrado para liquidaciones de crédito chilenas.
+    Formato esperado por línea (fila principal):
+      178039  24/12/2022  $ 776.475  28/07/2023  216  21,20%  0,0589%  $ 98.768  ($ 776.475)  ($ 677.707)  $ 98.768
+    Formato fila de saldo:
+      saldo 178039  29/07/2023  $ 98.768  27/05/2025  668  21,92%  0,0609%  $ 40.173
     """
-    # Patrón: línea que contiene un número de factura (5-6 dígitos),
-    # una fecha dd/mm/yyyy, montos con $ y días numéricos
-    patron_fila = re.compile(
-        r"(\d{5,7})\s+"                          # número factura
-        r"(\d{2}/\d{2}/\d{4})\s+"               # fecha mora
-        r"\$?\s*([\d.,]+)\s+"                    # capital
-        r"(?:\d{2}/\d{2}/\d{4})?\s*"            # fecha consig (opcional)
-        r"(\d{2,4})\s+"                          # días
-        r"([\d.,]+)\s*%?\s+"                     # tasa
-        r"([\d.,]+)\s*%?\s+"                     # factor diario
-        r"\$?\s*([\d.,]+)"                       # interés
+    patron_principal = re.compile(
+        r"^(\d{5,7})\s+"                              # N° factura
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+"              # fecha mora
+        r"\$?\s*([\d.,]+)\s+"                          # capital adeudado
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+"              # fecha consignación
+        r"(\d{2,4})\s+"                                # días de mora
+        r"([\d.,]+)\s*%?\s+"                           # T.I.C. %
+        r"([\d.,]+)\s*%?\s+"                           # factor diario
+        r"\$?\s*([\d.,]+)"                             # monto intereses período
+        , re.MULTILINE
     )
-    filas = []
-    for linea in texto.split("\n"):
-        m = patron_fila.search(linea)
-        if m:
-            filas.append(list(m.groups()))
-    if filas:
-        header = ["numero","fecha_mora","capital","fecha_liq","dias","tasa","factor_dia","interes_liq"]
-        return [header] + filas
-    return []
+    patron_saldo = re.compile(
+        r"^saldo\s+(\d{5,7})\s+"                      # "saldo" + N° factura
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+"              # fecha inicio saldo
+        r"\$?\s*([\d.,]+)\s+"                          # capital saldo (= interés P1)
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+"              # fecha fin saldo
+        r"(\d{2,4})\s+"                                # días saldo
+        r"([\d.,]+)\s*%?\s+"                           # tasa saldo
+        r"([\d.,]+)\s*%?\s+"                           # factor saldo
+        r"\$?\s*([\d.,]+)"                             # interés saldo
+        , re.MULTILINE | re.IGNORECASE
+    )
 
-
-def extraer_tabla_estrategia4(texto: str) -> list[list]:
-    """
-    Estrategia 4: parseo flexible línea a línea.
-    Busca cualquier línea que tenga un número de 5+ dígitos (factura),
-    seguido de números que puedan ser capital/días/tasa.
-    """
-    filas = []
-    patron_num = re.compile(r"\b(\d{5,7})\b")
-    patron_monto = re.compile(r"\$?\s*([\d]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)")
-    patron_pct = re.compile(r"([\d]{1,2}[.,]\d{1,2})\s*%")
-    patron_dias = re.compile(r"\b(\d{2,4})\b")
-    patron_fecha = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
+    principales = {}
+    saldos      = {}
 
     for linea in texto.split("\n"):
         linea = linea.strip()
-        if len(linea) < 20:
+        m = patron_principal.match(linea)
+        if m:
+            num = m.group(1)
+            principales[num] = {
+                "numero":      num,
+                "fecha_mora":  m.group(2),
+                "capital":     limpiar_numero(m.group(3)),
+                "fecha_liq":   m.group(4),
+                "dias":        int(m.group(5)),
+                "tasa":        limpiar_numero(m.group(6)),
+                "factor_dia":  limpiar_numero(m.group(7)),
+                "interes_liq": limpiar_numero(m.group(8)),
+                "consig":      0.0,
+                "capital_am":  0.0,
+            }
             continue
-        nums_factura = patron_num.findall(linea)
-        if not nums_factura:
-            continue
-        montos = patron_monto.findall(linea)
-        tasas  = patron_pct.findall(linea)
-        fechas = patron_fecha.findall(linea)
-        dias_list = patron_dias.findall(linea)
 
-        if len(montos) >= 2 and (tasas or len(dias_list) >= 2):
-            def pn(s):
-                return limpiar_numero(s)
+        ms = patron_saldo.match(linea)
+        if ms:
+            num = ms.group(1)
+            saldos[num] = {
+                "saldo_capital": limpiar_numero(ms.group(3)),
+                "dias_p2":       int(ms.group(5)),
+                "tasa_p2":       limpiar_numero(ms.group(6)),
+                "interes_p2":    limpiar_numero(ms.group(8)),
+                "fecha_desde_p2": ms.group(2),
+                "fecha_hasta_p2": ms.group(4),
+            }
 
-            capital = max([pn(m) for m in montos], default=0)
-            interes = pn(montos[-1]) if len(montos) > 1 else 0
-            tasa    = pn(tasas[0]) if tasas else 0
-            dias    = int(max([int(d) for d in dias_list if int(d) < 2000], default=0))
+    if not principales:
+        return []
 
-            if capital > 0 and dias > 0:
+    # Combinar principal + saldo
+    filas = []
+    for num, p in principales.items():
+        s = saldos.get(num, {})
+        p.update({
+            "tiene_saldo":    bool(s),
+            "saldo_capital":  s.get("saldo_capital", 0.0),
+            "dias_p1":        p["dias"],
+            "tasa_p1":        p["tasa"],
+            "interes_p1":     p["interes_liq"],
+            "dias_p2":        s.get("dias_p2", 0),
+            "tasa_p2":        s.get("tasa_p2", 0.0),
+            "interes_p2":     s.get("interes_p2", 0.0),
+        })
+        filas.append(p)
+
+    return filas  # lista de dicts — se pasa directo a DataFrame
+
+
+def extraer_tabla_estrategia4(texto: str) -> list:
+    """
+    Estrategia 4: fallback flexible.
+    Extrae cualquier línea con patrón: N°factura fecha $monto fecha días tasa% factor $interés
+    Sin distinguir principal/saldo — para PDFs con formato muy distinto.
+    """
+    filas = []
+    patron = re.compile(
+        r"(\d{5,7})\s+"
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+"
+        r"\$?\s*([\d.,]+)\s+"
+        r"(\d{1,2}/\d{1,2}/\d{2,4})?\s*"
+        r"(\d{2,4})\s+"
+        r"([\d.,]+)\s*%?\s*"
+        r"(?:[\d.,]+\s*%?\s*)?"
+        r"\$?\s*([\d.,]+)"
+    )
+    for linea in texto.split("\n"):
+        m = patron.search(linea.strip())
+        if m:
+            cap = limpiar_numero(m.group(3))
+            dias = int(m.group(5) or 0)
+            if cap > 0 and dias > 0:
                 filas.append({
-                    "numero":     nums_factura[0],
-                    "fecha_mora": fechas[0] if fechas else "",
-                    "capital":    capital,
-                    "fecha_liq":  fechas[1] if len(fechas) > 1 else "",
-                    "dias":       dias,
-                    "tasa":       tasa,
-                    "factor_dia": 0.0,
-                    "interes_liq":interes,
-                    "consig":     0.0,
-                    "capital_am": 0.0,
+                    "numero":      m.group(1),
+                    "fecha_mora":  m.group(2),
+                    "capital":     cap,
+                    "fecha_liq":   m.group(4) or "",
+                    "dias":        dias,
+                    "tasa":        limpiar_numero(m.group(6)),
+                    "factor_dia":  0.0,
+                    "interes_liq": limpiar_numero(m.group(7)),
+                    "consig":      0.0,
+                    "capital_am":  0.0,
+                    "tiene_saldo": False,
+                    "saldo_capital": 0.0,
+                    "dias_p1": dias,
+                    "tasa_p1": limpiar_numero(m.group(6)),
+                    "interes_p1": limpiar_numero(m.group(7)),
+                    "dias_p2": 0,
+                    "tasa_p2": 0.0,
+                    "interes_p2": 0.0,
                 })
     return filas
 
@@ -485,19 +539,18 @@ def extraer_tabla_pdf(file_bytes: bytes) -> tuple[pd.DataFrame, dict]:
                 df.attrs["estrategia"] = "2 — Detección por texto"
                 return df, meta
 
-    # Estrategia 3: regex sobre texto plano
-    tabla = extraer_tabla_estrategia3(texto_completo)
-    if tabla and len(tabla) > 2:
-        df = tabla_a_dataframe(tabla)
-        if not df.empty and len(df) >= 2:
-            df.attrs["estrategia"] = "3 — Parseo por expresiones regulares"
-            return df, meta
+    # Estrategia 3: parser calibrado para liquidaciones chilenas
+    filas3 = extraer_tabla_estrategia3(texto_completo)
+    if filas3 and len(filas3) >= 2:
+        df = pd.DataFrame(filas3)
+        df.attrs["estrategia"] = "3 — Parser calibrado (principal + saldo)"
+        return df, meta
 
-    # Estrategia 4: parseo flexible
-    filas = extraer_tabla_estrategia4(texto_completo)
-    if filas:
-        df = pd.DataFrame(filas)
-        df.attrs["estrategia"] = "4 — Parseo flexible (revisar datos)"
+    # Estrategia 4: fallback flexible
+    filas4 = extraer_tabla_estrategia4(texto_completo)
+    if filas4 and len(filas4) >= 2:
+        df = pd.DataFrame(filas4)
+        df.attrs["estrategia"] = "4 — Parser flexible"
         return df, meta
 
     return pd.DataFrame(), meta
@@ -509,66 +562,122 @@ def extraer_tabla_pdf(file_bytes: bytes) -> tuple[pd.DataFrame, dict]:
 
 def auditar(df: pd.DataFrame, base_liq: int) -> tuple[pd.DataFrame, list[dict]]:
     """
-    Recalcula intereses usando la base declarada por el tribunal.
-    Solo marca error si el número no cuadra con la base que el propio
-    tribunal declaró usar. La columna de comparación refleja esa base.
+    Audita la liquidación verificando cada período por separado.
+    Maneja tanto facturas de un período como de dos períodos (principal + saldo).
+    Solo marca error si el número no cuadra con la base declarada.
     """
     alertas = []
     filas   = []
-    col_ref = f"Interés según base {base_liq}d ($)"
+
+    tiene_dos_periodos = "dias_p1" in df.columns and "dias_p2" in df.columns
 
     for _, row in df.iterrows():
-        capital  = row.get("capital",  0)
-        dias     = row.get("dias",     0)
-        tasa     = row.get("tasa",     0)
-        int_liq  = row.get("interes_liq", 0)
+        num = row.get("numero", "")
+        cap = row.get("capital", 0)
 
-        if capital <= 0 or dias <= 0 or tasa <= 0:
+        if tiene_dos_periodos:
+            dias1    = row.get("dias_p1", row.get("dias", 0))
+            tasa1    = row.get("tasa_p1", row.get("tasa", 0))
+            int1_liq = row.get("interes_p1", row.get("interes_liq", 0))
+            saldo_cap= row.get("saldo_capital", 0)
+            dias2    = row.get("dias_p2", 0)
+            tasa2    = row.get("tasa_p2", 0)
+            int2_liq = row.get("interes_p2", 0)
+            tiene_p2 = row.get("tiene_saldo", False) and dias2 > 0
+        else:
+            dias1    = row.get("dias", 0)
+            tasa1    = row.get("tasa", 0)
+            int1_liq = row.get("interes_liq", 0)
+            saldo_cap= 0
+            dias2 = tasa2 = int2_liq = 0
+            tiene_p2 = False
+
+        if cap <= 0 or dias1 <= 0 or tasa1 <= 0:
             continue
 
-        # Recalcular con la base que el tribunal declaró usar
-        int_base_decl = calcular_interes(capital, dias, tasa, base_liq)
-        # También calcular con 365 para mostrarlo como referencia
-        int_365       = calcular_interes(capital, dias, tasa, 365)
+        # ── Período 1 ──
+        int1_calc = calcular_interes(cap, dias1, tasa1, base_liq)
+        diff1     = int1_liq - int1_calc
+        tol1      = max(int1_liq * 0.015, 10)
 
-        # La diferencia relevante es contra la base declarada
-        diff = int_liq - int_base_decl
-        tolerancia = max(int_liq * 0.01, 10)  # 1% o $10, lo que sea mayor
-
-        estado = "✓ OK"
-        if abs(diff) > tolerancia:
-            estado = "⚠ Diferencia"
-        if abs(diff) > tolerancia * 5:
-            estado = "✗ Error"
-
-        filas.append({
-            "N° Factura":          row.get("numero", ""),
-            "Fecha mora":          row.get("fecha_mora", ""),
-            "Capital ($)":         capital,
-            "Días":                dias,
-            "Tasa (%)":            tasa,
-            "Interés liquidado ($)": int_liq,
-            col_ref:               int_base_decl,
-            "Ref. 365d ($)":       int_365,
-            "Diferencia ($)":      diff,
-            "Estado":              estado,
-        })
-
-        # Solo alerta si no cuadra con la base declarada
-        if abs(diff) > tolerancia:
+        estado1 = "✓ OK"
+        if abs(diff1) > tol1:
+            estado1 = "✗ Error P1"
             alertas.append({
-                "nivel": "roja" if abs(diff) > tolerancia * 5 else "amarilla",
-                "titulo": f"Factura {row.get('numero','?')} — No cuadra con base {base_liq} días",
+                "nivel": "roja",
+                "titulo": f"Factura {num} — Error aritmético en período 1",
                 "detalle": (
-                    f"Liquidado: {fmt_clp(int_liq)} | "
-                    f"Calculado con base {base_liq}d: {fmt_clp(int_base_decl)} | "
-                    f"Diferencia: {fmt_clp(abs(diff))} | "
-                    f"Referencia base 365d: {fmt_clp(int_365)}"
+                    f"Capital: {fmt_clp(cap)} | Días: {dias1} | Tasa: {tasa1}% | "
+                    f"Liquidado: {fmt_clp(int1_liq)} | "
+                    f"Calculado (base {base_liq}d): {fmt_clp(int1_calc)} | "
+                    f"Diferencia: {fmt_clp(abs(diff1))}"
                 ),
             })
 
-    df_out = pd.DataFrame(filas)
-    return df_out, alertas
+        # ── Período 2 (saldo) ──
+        int2_calc = 0.0
+        diff2     = 0.0
+        estado2   = "—"
+
+        if tiene_p2 and saldo_cap > 0 and tasa2 > 0:
+            int2_calc = calcular_interes(saldo_cap, dias2, tasa2, base_liq)
+            diff2     = int2_liq - int2_calc
+            tol2      = max(int2_liq * 0.015, 10)
+            estado2   = "✓ OK"
+
+            if abs(diff2) > tol2:
+                estado2 = "✗ Error P2"
+                alertas.append({
+                    "nivel": "roja",
+                    "titulo": f"Factura {num} — Error aritmético en período 2 (saldo)",
+                    "detalle": (
+                        f"Saldo capital: {fmt_clp(saldo_cap)} | Días: {dias2} | Tasa: {tasa2}% | "
+                        f"Liquidado: {fmt_clp(int2_liq)} | "
+                        f"Calculado (base {base_liq}d): {fmt_clp(int2_calc)} | "
+                        f"Diferencia: {fmt_clp(abs(diff2))}"
+                    ),
+                })
+
+            # ── Detectar anatocismo ──
+            # Si saldo_capital ≈ interés del período 1, es interés sobre interés
+            if int1_liq > 0 and abs(saldo_cap - int1_liq) / max(int1_liq, 1) < 0.02:
+                alertas.append({
+                    "nivel": "roja",
+                    "titulo": f"🚨 Factura {num} — Anatocismo (Art. 9, Ley 18.010)",
+                    "detalle": (
+                        f"El capital del período 2 ({fmt_clp(saldo_cap)}) coincide con "
+                        f"el interés del período 1 ({fmt_clp(int1_liq)}), lo que indica "
+                        f"que se están calculando intereses sobre intereses. "
+                        f"Esto está prohibido por el Art. 9 de la Ley N° 18.010."
+                    ),
+                })
+
+        int_total_liq  = int1_liq + int2_liq
+        int_total_calc = int1_calc + int2_calc
+
+        fila = {
+            "N° Factura":           num,
+            "Fecha mora":           row.get("fecha_mora", ""),
+            "Capital ($)":          cap,
+            f"Días P1 | Tasa P1":   f"{dias1} | {tasa1}%",
+            f"Interés P1 liq ($)":  int1_liq,
+            f"Interés P1 calc ({base_liq}d) ($)": int1_calc,
+            "Estado P1":            estado1,
+        }
+        if tiene_p2:
+            fila.update({
+                "Días P2 | Tasa P2":  f"{dias2} | {tasa2}%",
+                "Interés P2 liq ($)": int2_liq,
+                f"Interés P2 calc ({base_liq}d) ($)": int2_calc,
+                "Estado P2":          estado2,
+                "Total interés liq ($)":  int_total_liq,
+                "Total interés calc ($)": int_total_calc,
+                "Diferencia total ($)":   int_total_liq - int_total_calc,
+            })
+
+        filas.append(fila)
+
+    return pd.DataFrame(filas), alertas
 
 
 def auditar_comision(df_raw: pd.DataFrame, texto_pdf: str) -> list[dict]:
@@ -1210,11 +1319,14 @@ for col in ["capital", "interes_liq", "consig", "capital_am"]:
 st.dataframe(df_display, use_container_width=True, hide_index=True)
 
 # ── Auditoría ──
-st.markdown('<div class="seccion-titulo">Re-cálculo del auditor (base 365 días)</div>', unsafe_allow_html=True)
-
 df_auditado, alertas_calc = auditar(df_raw, base_liquidacion)
 alertas_base  = auditar_base_dias(df_raw, base_liquidacion, texto_pdf)
 alertas_com   = auditar_comision(df_raw, texto_pdf)
+
+st.markdown(
+    f'<div class="seccion-titulo">Re-cálculo del auditor — verificando consistencia con base {base_liquidacion} días</div>',
+    unsafe_allow_html=True,
+)
 
 # ── Analizar sentencia si fue subida ──
 alertas_sentencia = []
@@ -1236,21 +1348,15 @@ todas_alertas = alertas_base + alertas_com + alertas_calc + alertas_sentencia
 
 # Colorear tabla auditada
 def colorear_fila(row):
-    if row["Estado"] == "✗ Error":
+    estados = [str(v) for k, v in row.items() if "Estado" in str(k)]
+    if any("Error" in e for e in estados):
         return ["background-color: #fce8e8"] * len(row)
-    elif row["Estado"] == "⚠ Diferencia":
+    if any("Diferencia" in e for e in estados):
         return ["background-color: #fef3e2"] * len(row)
     return [""] * len(row)
 
-cols_fmt = {
-    "Capital ($)":           "{:,.0f}",
-    "Interés liquidado ($)": "{:,.0f}",
-    "Diferencia ($)":        "{:,.0f}",
-}
-# Agregar columnas numéricas dinámicas al formato
-for col in df_auditado.columns:
-    if "base" in col.lower() or "365d" in col.lower() or "correcto" in col.lower():
-        cols_fmt[col] = "{:,.0f}"
+# Formato dinámico: aplicar formato numérico a todas las columnas con ($)
+cols_fmt = {c: "{:,.0f}" for c in df_auditado.columns if "($)" in str(c)}
 
 if not df_auditado.empty:
     df_styled = (
@@ -1262,13 +1368,11 @@ if not df_auditado.empty:
 
 # ── Métricas resumen ──
 if not df_auditado.empty:
-    total_liq  = df_auditado["Interés liquidado ($)"].sum()
-    # Buscar columna de referencia con nombre dinámico
-    col_ref = next(
-        (c for c in df_auditado.columns if "base" in c.lower() or "365d" in c.lower() or "correcto" in c.lower()),
-        None
-    )
-    total_corr = df_auditado[col_ref].sum() if col_ref else total_liq
+    # Sumar todas las columnas de interés liquidado
+    cols_liq  = [c for c in df_auditado.columns if "liq" in c.lower() and "($)" in c]
+    cols_calc = [c for c in df_auditado.columns if "calc" in c.lower() and "($)" in c]
+    total_liq  = df_auditado[cols_liq].sum(numeric_only=True).sum()  if cols_liq  else 0
+    total_corr = df_auditado[cols_calc].sum(numeric_only=True).sum() if cols_calc else total_liq
     diff_total = total_liq - total_corr
     n_errores  = len([a for a in todas_alertas if a["nivel"] == "roja"])
 
@@ -1278,8 +1382,7 @@ if not df_auditado.empty:
     with mc1:
         st.metric("Intereses liquidados", fmt_clp(total_liq))
     with mc2:
-        label_ref = col_ref if col_ref else "Interés referencia"
-        st.metric(label_ref, fmt_clp(total_corr))
+        st.metric(f"Interés calculado (base {base_liquidacion}d)", fmt_clp(total_corr))
     with mc3:
         color = "normal" if diff_total <= 0 else "inverse"
         st.metric("Exceso cobrado", fmt_clp(abs(diff_total)), delta=f"{diff_total/total_corr*100:.2f}%" if total_corr else "—", delta_color=color)
