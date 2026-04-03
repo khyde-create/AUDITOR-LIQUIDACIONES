@@ -395,17 +395,121 @@ def normalizar_texto_liquidacion(texto: str) -> str:
 
 def extraer_tabla_estrategia3(texto: str) -> list:
     """
-    Parser calibrado para el formato real de liquidaciones del PJUD chileno.
+    Parser para liquidaciones del PJUD chileno.
+    Maneja el formato real donde los datos están en una sola línea continua
+    con montos que tienen espacios internos (ej: '$ 7 76.475') y sin
+    separadores entre el interés de una factura y el número de la siguiente.
 
-    Formato real (una línea por factura, montos con espacios internos):
-    178039 24/12/2022 $ 7 76.475 28/07/2023 216 21,20% 0,0589% $ 98.768 ($ 7 76.475) ...
-    saldo 178039 29/07/2023 $ 9 8.768 27/05/2025 668 21,92% 0,0609% $ 40.173
-
-    Estrategia: buscar número de factura + fecha + reconstruir monto
-    ignorando los espacios internos de los valores.
+    Estrategia:
+    1. Extraer todos los números de factura presentes
+    2. Usar esos números para insertar separadores precisos
+    3. Parsear línea por línea
     """
-    # Normalizar primero — maneja texto pegado sin saltos de línea
-    texto = normalizar_texto_liquidacion(texto)
+    # ── Paso 1: Encontrar todos los números de factura ──
+    nums_factura = re.findall(
+        r'(?<!\d)(\d{5,7})(?=\s+\d{1,2}/\d{1,2}/\d{4})',
+        texto
+    )
+    nums_factura = sorted(set(nums_factura), key=lambda x: int(x))
+    if not nums_factura:
+        return []
+
+    # ── Paso 2: Insertar \n antes de cada factura y saldo ──
+    t = texto
+    for num in nums_factura:
+        # Caso 1: número de factura pegado al final del interés anterior (sin espacio)
+        t = re.sub(
+            r'(\d)(' + re.escape(num) + r')(\s+\d{1,2}/\d{1,2}/\d{4})',
+            r'\1\n\2\3', t
+        )
+        # Caso 2: "saldo NUM" — insertar \n antes de "saldo"
+        t = re.sub(
+            r'(\d)(saldo\s+' + re.escape(num) + r')(\s+\d{1,2}/\d{1,2}/\d{4})',
+            r'\1\n\2\3', t, flags=re.IGNORECASE
+        )
+        # Caso 3: primera factura pegada a texto de cabecera
+        t = re.sub(
+            r'([a-zA-Z\)])(' + re.escape(num) + r')(\s+\d{1,2}/\d{1,2}/\d{4})',
+            r'\1\n\2\3', t
+        )
+
+    # ── Paso 3: Parsear cada línea ──
+    patron_p = re.compile(
+        r'^(\d{5,7})\s+(\d{1,2}/\d{1,2}/\d{4})\s+'
+        r'\$\s*([\d\s.,]+?)\s+(\d{1,2}/\d{1,2}/\d{4})\s+'
+        r'(\d{2,4})\s+([\d,]+)\s*%\s+[\d,]+\s*%\s+\$\s*([\d.,]+)'
+    )
+    patron_s = re.compile(
+        r'^saldo\s+(\d{5,7})\s+(\d{1,2}/\d{1,2}/\d{4})\s+'
+        r'\$\s*([\d\s.,]+?)\s+(\d{1,2}/\d{1,2}/\d{4})\s+'
+        r'(\d{2,4})\s+([\d,]+)\s*%\s+[\d,]+\s*%\s+\$\s*([\d.,]+)',
+        re.IGNORECASE
+    )
+
+    principales = {}
+    saldos      = {}
+
+    for linea in t.split("\n"):
+        linea = linea.strip()
+        if not linea:
+            continue
+
+        ms = patron_s.match(linea)
+        if ms:
+            num = ms.group(1)
+            saldos[num] = {
+                "saldo_capital": limpiar_monto_pdf(ms.group(3)),
+                "dias_p2":       int(ms.group(5)),
+                "tasa_p2":       float(ms.group(6).replace(",",".")),
+                "interes_p2":    limpiar_monto_pdf(ms.group(7)),
+            }
+            continue
+
+        m = patron_p.match(linea)
+        if m:
+            num = m.group(1)
+            cap     = limpiar_monto_pdf(m.group(3))
+            interes = limpiar_monto_pdf(m.group(7))
+            # Quedarse con el registro de mayor capital (el original, no el saldo)
+            if num not in principales or cap > principales[num].get("capital", 0):
+                principales[num] = {
+                    "numero":      num,
+                    "fecha_mora":  m.group(2),
+                    "capital":     cap,
+                    "fecha_liq":   m.group(4),
+                    "dias":        int(m.group(5)),
+                    "tasa":        float(m.group(6).replace(",",".")),
+                    "factor_dia":  0.0,
+                    "interes_liq": interes,
+                    "consig":      0.0,
+                    "capital_am":  0.0,
+                    "dias_p1":     int(m.group(5)),
+                    "tasa_p1":     float(m.group(6).replace(",",".")),
+                    "interes_p1":  interes,
+                    "tiene_saldo": False,
+                    "saldo_capital": 0.0,
+                    "dias_p2":     0,
+                    "tasa_p2":     0.0,
+                    "interes_p2":  0.0,
+                }
+
+    if not principales:
+        return []
+
+    # ── Paso 4: Combinar principal + saldo ──
+    resultado = []
+    for num in sorted(principales.keys()):
+        p = principales[num]
+        s = saldos.get(num, {})
+        if s:
+            p["tiene_saldo"]   = True
+            p["saldo_capital"] = s["saldo_capital"]
+            p["dias_p2"]       = s["dias_p2"]
+            p["tasa_p2"]       = s["tasa_p2"]
+            p["interes_p2"]    = s["interes_p2"]
+        resultado.append(p)
+
+    return resultado
     # Patrón para línea principal:
     # NNNNN  DD/MM/AAAA  [$ fragmentos]  DD/MM/AAAA  DIAS  TASA%  FACTOR%  $ INTERES
     patron_p = re.compile(
