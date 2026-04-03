@@ -349,6 +349,27 @@ UMBRAL_MINIMO = 1000  # $1.000 pesos
 def es_relevante(diff: float) -> bool:
     """Retorna True solo si la diferencia justifica una objeción."""
     return abs(diff) >= UMBRAL_MINIMO
+
+
+def detectar_base(df: pd.DataFrame, texto: str) -> int:
+    tl = texto.lower()
+    if any(p in tl for p in ["dividida por 360","dividido por 360","360 días","360 dias","/ 360"]):
+        return 360
+    if any(p in tl for p in ["dividida por 365","dividido por 365","365 días","365 dias","/ 365"]):
+        return 365
+    v360 = v365 = 0
+    for _, r in df.iterrows():
+        cap  = r.get("capital", 0)
+        dias = r.get("dias_p1", r.get("dias", 0))
+        tasa = r.get("tasa_p1", r.get("tasa", 0))
+        il   = r.get("interes_p1", r.get("interes_liq", 0))
+        if cap > 0 and dias > 0 and tasa > 0 and il > 0:
+            tol = il * 0.015
+            if abs(calcular_interes(cap, int(dias), tasa, 360) - il) <= tol:
+                v360 += 1
+            if abs(calcular_interes(cap, int(dias), tasa, 365) - il) <= tol:
+                v365 += 1
+    return 360 if v360 >= v365 else 365
     tl = texto.lower()
     if any(p in tl for p in ["dividida por 360", "dividido por 360", "360 días", "360 dias", "/ 360"]):
         return 360
