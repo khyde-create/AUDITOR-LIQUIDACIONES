@@ -322,91 +322,174 @@ def extraer_tabla_estrategia2(pdf) -> list[list]:
     return []
 
 
-def extraer_tabla_estrategia3(texto: str) -> list[list]:
+def limpiar_monto_pdf(texto: str) -> float:
     """
-    Estrategia 3: parser calibrado para liquidaciones de crédito chilenas.
-    Formato esperado por línea (fila principal):
-      178039  24/12/2022  $ 776.475  28/07/2023  216  21,20%  0,0589%  $ 98.768  ($ 776.475)  ($ 677.707)  $ 98.768
-    Formato fila de saldo:
-      saldo 178039  29/07/2023  $ 98.768  27/05/2025  668  21,92%  0,0609%  $ 40.173
+    Limpia montos con espacios internos y $ al final.
+    Ej: '7 76.475 $' → 776475.0
+        '1 .244.145 $' → 1244145.0
+        '9 8.768 $' → 98768.0
     """
-    patron_principal = re.compile(
-        r"^(\d{5,7})\s+"                              # N° factura
-        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+"              # fecha mora
-        r"\$?\s*([\d.,]+)\s+"                          # capital adeudado
-        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+"              # fecha consignación
-        r"(\d{2,4})\s+"                                # días de mora
-        r"([\d.,]+)\s*%?\s+"                           # T.I.C. %
-        r"([\d.,]+)\s*%?\s+"                           # factor diario
-        r"\$?\s*([\d.,]+)"                             # monto intereses período
-        , re.MULTILINE
-    )
-    patron_saldo = re.compile(
-        r"^saldo\s+(\d{5,7})\s+"                      # "saldo" + N° factura
-        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+"              # fecha inicio saldo
-        r"\$?\s*([\d.,]+)\s+"                          # capital saldo (= interés P1)
-        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+"              # fecha fin saldo
-        r"(\d{2,4})\s+"                                # días saldo
-        r"([\d.,]+)\s*%?\s+"                           # tasa saldo
-        r"([\d.,]+)\s*%?\s+"                           # factor saldo
-        r"\$?\s*([\d.,]+)"                             # interés saldo
-        , re.MULTILINE | re.IGNORECASE
-    )
+    if not texto:
+        return 0.0
+    # Quitar $ y espacios, luego unir dígitos separados por espacio
+    s = str(texto).replace("$", "").strip()
+    # Unir números separados por espacios (ej: "7 76.475" → "776.475")
+    partes = s.split()
+    s = "".join(partes)
+    # Ahora limpiar puntos de miles y comas decimales
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
 
-    principales = {}
-    saldos      = {}
 
-    for linea in texto.split("\n"):
-        linea = linea.strip()
-        m = patron_principal.match(linea)
-        if m:
-            num = m.group(1)
-            principales[num] = {
-                "numero":      num,
-                "fecha_mora":  m.group(2),
-                "capital":     limpiar_numero(m.group(3)),
-                "fecha_liq":   m.group(4),
-                "dias":        int(m.group(5)),
-                "tasa":        limpiar_numero(m.group(6)),
-                "factor_dia":  limpiar_numero(m.group(7)),
-                "interes_liq": limpiar_numero(m.group(8)),
-                "consig":      0.0,
-                "capital_am":  0.0,
-            }
-            continue
+def extraer_tabla_estrategia3(texto: str) -> list:
+    """
+    Parser para liquidaciones chilenas donde cada campo ocupa su propia línea.
+    Formato real extraído por pdfplumber:
 
+        178039
+        24/12/2022
+        7 76.475 $
+        28/07/2023
+        216
+        21,20%
+        saldo 178039
+        29/07/2023
+        9 8.768 $
+        27/05/2025
+        668
+        21,92%
+
+    Agrupa líneas en bloques de 6 y reconstruye cada factura.
+    """
+    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
+
+    patron_num    = re.compile(r"^\d{5,7}$")
+    patron_saldo  = re.compile(r"^saldo\s+(\d{5,7})$", re.IGNORECASE)
+    patron_fecha  = re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
+    patron_dias   = re.compile(r"^\d{2,4}$")
+    patron_tasa   = re.compile(r"^[\d.,]+\s*%$")
+    patron_monto  = re.compile(r"^[\d\s.,]+\$?$")
+
+    # Encontrar el inicio de la tabla buscando el primer número de factura
+    inicio = 0
+    for i, l in enumerate(lineas):
+        if patron_num.match(l):
+            inicio = i
+            break
+
+    registros_principales = {}  # num → dict
+    registros_saldo       = {}  # num → dict
+
+    i = inicio
+    while i < len(lineas):
+        linea = lineas[i]
+
+        # ── Fila principal: empieza con número de 5-7 dígitos ──
+        if patron_num.match(linea):
+            num = linea
+            # Leer los siguientes campos en orden
+            campos = []
+            j = i + 1
+            while j < len(lineas) and len(campos) < 5:
+                l = lineas[j]
+                # Parar si encontramos otro número de factura o "saldo"
+                if patron_num.match(l) or patron_saldo.match(l):
+                    break
+                campos.append(l)
+                j += 1
+
+            if len(campos) >= 5:
+                fecha_mora = campos[0] if patron_fecha.match(campos[0]) else ""
+                capital    = limpiar_monto_pdf(campos[1])
+                fecha_liq  = campos[2] if patron_fecha.match(campos[2]) else ""
+                dias_str   = campos[3]
+                tasa_str   = campos[4]
+
+                dias = int(dias_str) if patron_dias.match(dias_str) else 0
+                tasa_raw = tasa_str.replace("%","").replace(",",".").strip()
+                try:
+                    tasa = float(tasa_raw)
+                except ValueError:
+                    tasa = 0.0
+
+                if capital > 0 and dias > 0:
+                    registros_principales[num] = {
+                        "numero":      num,
+                        "fecha_mora":  fecha_mora,
+                        "capital":     capital,
+                        "fecha_liq":   fecha_liq,
+                        "dias":        dias,
+                        "tasa":        tasa,
+                        "factor_dia":  0.0,
+                        "interes_liq": 0.0,
+                        "consig":      0.0,
+                        "capital_am":  0.0,
+                        "dias_p1":     dias,
+                        "tasa_p1":     tasa,
+                        "interes_p1":  0.0,
+                        "tiene_saldo": False,
+                        "saldo_capital": 0.0,
+                        "dias_p2":     0,
+                        "tasa_p2":     0.0,
+                        "interes_p2":  0.0,
+                    }
+                i = j
+                continue
+
+        # ── Fila de saldo: empieza con "saldo NNNNN" ──
         ms = patron_saldo.match(linea)
         if ms:
             num = ms.group(1)
-            saldos[num] = {
-                "saldo_capital": limpiar_numero(ms.group(3)),
-                "dias_p2":       int(ms.group(5)),
-                "tasa_p2":       limpiar_numero(ms.group(6)),
-                "interes_p2":    limpiar_numero(ms.group(8)),
-                "fecha_desde_p2": ms.group(2),
-                "fecha_hasta_p2": ms.group(4),
-            }
+            campos = []
+            j = i + 1
+            while j < len(lineas) and len(campos) < 5:
+                l = lineas[j]
+                if patron_num.match(l) or patron_saldo.match(l):
+                    break
+                campos.append(l)
+                j += 1
 
-    if not principales:
+            if len(campos) >= 5:
+                saldo_cap  = limpiar_monto_pdf(campos[1])
+                dias_str   = campos[3]
+                tasa_str   = campos[4]
+                dias2 = int(dias_str) if patron_dias.match(dias_str) else 0
+                tasa_raw = tasa_str.replace("%","").replace(",",".").strip()
+                try:
+                    tasa2 = float(tasa_raw)
+                except ValueError:
+                    tasa2 = 0.0
+
+                registros_saldo[num] = {
+                    "saldo_capital": saldo_cap,
+                    "dias_p2":       dias2,
+                    "tasa_p2":       tasa2,
+                    "interes_p2":    0.0,
+                }
+                i = j
+                continue
+
+        i += 1
+
+    if not registros_principales:
         return []
 
     # Combinar principal + saldo
-    filas = []
-    for num, p in principales.items():
-        s = saldos.get(num, {})
-        p.update({
-            "tiene_saldo":    bool(s),
-            "saldo_capital":  s.get("saldo_capital", 0.0),
-            "dias_p1":        p["dias"],
-            "tasa_p1":        p["tasa"],
-            "interes_p1":     p["interes_liq"],
-            "dias_p2":        s.get("dias_p2", 0),
-            "tasa_p2":        s.get("tasa_p2", 0.0),
-            "interes_p2":     s.get("interes_p2", 0.0),
-        })
-        filas.append(p)
+    resultado = []
+    for num, p in registros_principales.items():
+        s = registros_saldo.get(num, {})
+        if s:
+            p["tiene_saldo"]   = True
+            p["saldo_capital"] = s.get("saldo_capital", 0.0)
+            p["dias_p2"]       = s.get("dias_p2", 0)
+            p["tasa_p2"]       = s.get("tasa_p2", 0.0)
+            p["interes_p2"]    = s.get("interes_p2", 0.0)
+        resultado.append(p)
 
-    return filas  # lista de dicts — se pasa directo a DataFrame
+    return resultado
 
 
 def extraer_tabla_estrategia4(texto: str) -> list:
