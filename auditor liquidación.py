@@ -338,7 +338,17 @@ def extraer_tabla_pdf(file_bytes: bytes) -> tuple:
 #  AUDITORÍA
 # ─────────────────────────────────────────────
 
-def detectar_base(df: pd.DataFrame, texto: str) -> int:
+# ─────────────────────────────────────────────
+#  UMBRAL MÍNIMO DE RELEVANCIA
+# ─────────────────────────────────────────────
+# Diferencias menores a este monto no se reportan —
+# no tienen relevancia práctica para objetar.
+UMBRAL_MINIMO = 1000  # $1.000 pesos
+
+
+def es_relevante(diff: float) -> bool:
+    """Retorna True solo si la diferencia justifica una objeción."""
+    return abs(diff) >= UMBRAL_MINIMO
     tl = texto.lower()
     if any(p in tl for p in ["dividida por 360", "dividido por 360", "360 días", "360 dias", "/ 360"]):
         return 360
@@ -378,7 +388,7 @@ def auditar(df: pd.DataFrame, base: int) -> tuple:
         tol1 = max(i1l * 0.015, 10)
         e1   = "✓ OK" if abs(i1l - i1c) <= tol1 else "✗ Error"
 
-        if e1 == "✗ Error":
+        if e1 == "✗ Error" and es_relevante(i1l - i1c):
             alertas.append({
                 "nivel": "roja",
                 "titulo": f"Factura {num} — Error aritmético período 1",
@@ -401,7 +411,7 @@ def auditar(df: pd.DataFrame, base: int) -> tuple:
             i2c  = calcular_interes(scap, int(d2), t2, base)
             tol2 = max(i2l * 0.015, 10)
             e2   = "✓ OK" if abs(i2l - i2c) <= tol2 else "✗ Error"
-            if e2 == "✗ Error":
+            if e2 == "✗ Error" and es_relevante(i2l - i2c):
                 alertas.append({
                     "nivel": "roja",
                     "titulo": f"Factura {num} — Error aritmético período 2 (saldo)",
@@ -411,8 +421,9 @@ def auditar(df: pd.DataFrame, base: int) -> tuple:
                         f"Diferencia: {fmt_clp(abs(i2l-i2c))}"
                     ),
                 })
-            # Anatocismo
-            if i1l > 0 and abs(scap - i1l) / max(i1l, 1) < 0.02:
+            # Anatocismo — saldo_capital ≈ interés_p1 Y diferencia relevante
+            diff_ana = abs(scap - i1l)
+            if i1l > 0 and diff_ana / max(i1l, 1) < 0.01 and es_relevante(i1l):
                 alertas.append({
                     "nivel": "roja",
                     "titulo": f"🚨 Factura {num} — Anatocismo (Art. 9, Ley 18.010)",
