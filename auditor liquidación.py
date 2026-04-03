@@ -256,71 +256,168 @@ def detectar_col(headers: list[str], opciones: list[str]) -> int | None:
     return None
 
 
-def extraer_tabla_pdf(file_bytes: bytes) -> tuple[pd.DataFrame, dict]:
-    """
-    Extrae la tabla principal de intereses del PDF.
-    Retorna (DataFrame, metadatos del encabezado).
-    """
+def extraer_meta(texto: str) -> dict:
+    """Extrae metadatos del encabezado del PDF."""
     meta = {}
-    filas_datos = []
-    headers_encontrados = None
+    for linea in texto.split("\n"):
+        ll = linea.lower().strip()
+        if not linea.strip():
+            continue
+        if "rol" in ll and ":" in linea and not meta.get("rol"):
+            val = linea.split(":", 1)[-1].strip()
+            if val:
+                meta["rol"] = val
+        if ("carátula" in ll or "caratula" in ll) and ":" in linea and not meta.get("caratula"):
+            meta["caratula"] = linea.split(":", 1)[-1].strip()
+        if "juzgado" in ll and not meta.get("tribunal"):
+            meta["tribunal"] = linea.strip()
+        if "santiago" in ll and not meta.get("fecha_liq"):
+            meta["fecha_liq"] = linea.strip()
+    return meta
 
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        texto_completo = ""
-        for page in pdf.pages:
-            texto_completo += (page.extract_text() or "") + "\n"
 
-        # Extraer metadatos del encabezado
-        for linea in texto_completo.split("\n"):
-            ll = linea.lower().strip()
-            if "rol" in ll and ":" in linea:
-                meta["rol"] = linea.split(":", 1)[-1].strip()
-            if "carátula" in ll or "caratula" in ll:
-                meta["caratula"] = linea.split(":", 1)[-1].strip()
-            if "tribunal" in ll and "juzgado" in ll.lower():
-                meta["tribunal"] = linea.strip()
-            if "fecha" in ll and "santiago" in ll.lower():
-                meta["fecha_liq"] = linea.strip()
+def extraer_tabla_estrategia1(pdf) -> list[list]:
+    """
+    Estrategia 1: extract_tables() estándar de pdfplumber.
+    Funciona cuando la tabla tiene bordes bien definidos.
+    """
+    for page in pdf.pages:
+        for table in (page.extract_tables() or []):
+            if not table or len(table) < 3:
+                continue
+            for row_i, row in enumerate(table):
+                row_text = " ".join(str(c).lower() for c in row if c)
+                if any(kw in row_text for kw in ["capital", "días", "mora", "tasa", "interés"]):
+                    return table[row_i:]  # encabezado + datos
+    return []
 
-        # Buscar tablas en todas las páginas
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                if not table or len(table) < 3:
-                    continue
-                # Buscar fila de encabezados (primera fila con texto de columna)
+
+def extraer_tabla_estrategia2(pdf) -> list[list]:
+    """
+    Estrategia 2: extract_table con configuración laxa de bordes.
+    Funciona con tablas que tienen líneas tenues o sin bordes.
+    """
+    settings = {
+        "vertical_strategy":   "text",
+        "horizontal_strategy": "text",
+        "snap_tolerance":      5,
+        "join_tolerance":      5,
+        "edge_min_length":     10,
+        "min_words_vertical":  2,
+        "min_words_horizontal":1,
+        "keep_blank_chars":    False,
+        "text_tolerance":      5,
+    }
+    for page in pdf.pages:
+        try:
+            table = page.extract_table(settings)
+            if table and len(table) > 3:
                 for row_i, row in enumerate(table):
-                    row_clean = [str(c).lower().strip() if c else "" for c in row]
-                    row_text  = " ".join(row_clean)
-                    # Señal de que es la cabecera de la tabla de intereses
-                    if any(kw in row_text for kw in ["capital", "días", "tasa", "interés", "mora"]):
-                        headers_encontrados = row
-                        # Tomar las filas de datos siguientes
-                        for data_row in table[row_i + 1:]:
-                            if data_row and any(c for c in data_row):
-                                filas_datos.append(data_row)
-                        break
-                if headers_encontrados:
-                    break
-            if headers_encontrados:
-                break
+                    row_text = " ".join(str(c).lower() for c in row if c)
+                    if any(kw in row_text for kw in ["capital", "días", "mora", "tasa"]):
+                        return table[row_i:]
+        except Exception:
+            continue
+    return []
 
-    if not headers_encontrados or not filas_datos:
-        return pd.DataFrame(), meta
 
-    # Mapear columnas
+def extraer_tabla_estrategia3(texto: str) -> list[list]:
+    """
+    Estrategia 3: parseo por texto plano con regex.
+    Funciona cuando pdfplumber extrae texto pero no detecta tabla.
+    Busca líneas con patrón: número factura | fecha | monto | días | tasa%
+    """
+    # Patrón: línea que contiene un número de factura (5-6 dígitos),
+    # una fecha dd/mm/yyyy, montos con $ y días numéricos
+    patron_fila = re.compile(
+        r"(\d{5,7})\s+"                          # número factura
+        r"(\d{2}/\d{2}/\d{4})\s+"               # fecha mora
+        r"\$?\s*([\d.,]+)\s+"                    # capital
+        r"(?:\d{2}/\d{2}/\d{4})?\s*"            # fecha consig (opcional)
+        r"(\d{2,4})\s+"                          # días
+        r"([\d.,]+)\s*%?\s+"                     # tasa
+        r"([\d.,]+)\s*%?\s+"                     # factor diario
+        r"\$?\s*([\d.,]+)"                       # interés
+    )
+    filas = []
+    for linea in texto.split("\n"):
+        m = patron_fila.search(linea)
+        if m:
+            filas.append(list(m.groups()))
+    if filas:
+        header = ["numero","fecha_mora","capital","fecha_liq","dias","tasa","factor_dia","interes_liq"]
+        return [header] + filas
+    return []
+
+
+def extraer_tabla_estrategia4(texto: str) -> list[list]:
+    """
+    Estrategia 4: parseo flexible línea a línea.
+    Busca cualquier línea que tenga un número de 5+ dígitos (factura),
+    seguido de números que puedan ser capital/días/tasa.
+    """
+    filas = []
+    patron_num = re.compile(r"\b(\d{5,7})\b")
+    patron_monto = re.compile(r"\$?\s*([\d]{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?)")
+    patron_pct = re.compile(r"([\d]{1,2}[.,]\d{1,2})\s*%")
+    patron_dias = re.compile(r"\b(\d{2,4})\b")
+    patron_fecha = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
+
+    for linea in texto.split("\n"):
+        linea = linea.strip()
+        if len(linea) < 20:
+            continue
+        nums_factura = patron_num.findall(linea)
+        if not nums_factura:
+            continue
+        montos = patron_monto.findall(linea)
+        tasas  = patron_pct.findall(linea)
+        fechas = patron_fecha.findall(linea)
+        dias_list = patron_dias.findall(linea)
+
+        if len(montos) >= 2 and (tasas or len(dias_list) >= 2):
+            def pn(s):
+                return limpiar_numero(s)
+
+            capital = max([pn(m) for m in montos], default=0)
+            interes = pn(montos[-1]) if len(montos) > 1 else 0
+            tasa    = pn(tasas[0]) if tasas else 0
+            dias    = int(max([int(d) for d in dias_list if int(d) < 2000], default=0))
+
+            if capital > 0 and dias > 0:
+                filas.append({
+                    "numero":     nums_factura[0],
+                    "fecha_mora": fechas[0] if fechas else "",
+                    "capital":    capital,
+                    "fecha_liq":  fechas[1] if len(fechas) > 1 else "",
+                    "dias":       dias,
+                    "tasa":       tasa,
+                    "factor_dia": 0.0,
+                    "interes_liq":interes,
+                    "consig":     0.0,
+                    "capital_am": 0.0,
+                })
+    return filas
+
+
+def tabla_a_dataframe(tabla: list[list], es_dict=False) -> pd.DataFrame:
+    """Convierte la tabla extraída a DataFrame normalizado."""
+    if es_dict:
+        return pd.DataFrame(tabla)
+
+    if not tabla or len(tabla) < 2:
+        return pd.DataFrame()
+
+    headers = tabla[0]
     col_map = {}
     for campo, opciones in COLS_BUSCAR.items():
-        idx = detectar_col(headers_encontrados, opciones)
+        idx = detectar_col(headers, opciones)
         if idx is not None:
             col_map[campo] = idx
 
-    # Construir DataFrame
     registros = []
-    for fila in filas_datos:
-        # Saltar filas vacías o de totales sin número de factura
-        celda_num = fila[col_map.get("numero", 0)] if col_map.get("numero") is not None else ""
-        if celda_num is None or str(celda_num).strip() == "":
+    for fila in tabla[1:]:
+        if not fila or not any(c for c in fila):
             continue
 
         def get(campo):
@@ -329,27 +426,80 @@ def extraer_tabla_pdf(file_bytes: bytes) -> tuple[pd.DataFrame, dict]:
                 return None
             return fila[idx]
 
+        num = str(get("numero") or "").strip()
+        if not num or num.lower() in ["n°", "n", ""]:
+            continue
+
         try:
-            registro = {
-                "numero":     str(get("numero") or "").strip(),
+            cap = limpiar_numero(get("capital"))
+            dias = int(limpiar_numero(get("dias")) or 0)
+            if cap <= 0 and dias <= 0:
+                continue
+
+            registros.append({
+                "numero":     num,
                 "fecha_mora": str(get("fecha_mora") or "").strip(),
-                "capital":    limpiar_numero(get("capital")),
+                "capital":    cap,
                 "fecha_liq":  str(get("fecha_liq") or "").strip(),
-                "dias":       int(limpiar_numero(get("dias")) or 0),
+                "dias":       dias,
                 "tasa":       limpiar_numero(get("tasa")),
                 "factor_dia": limpiar_numero(get("factor_dia")),
                 "interes_liq":limpiar_numero(get("interes")),
                 "consig":     abs(limpiar_numero(get("consig_neg"))),
                 "capital_am": limpiar_numero(get("capital_am")),
-            }
-            # Solo incluir si tiene capital o días
-            if registro["capital"] > 0 or registro["dias"] > 0:
-                registros.append(registro)
+            })
         except Exception:
             continue
 
-    df = pd.DataFrame(registros)
-    return df, meta
+    return pd.DataFrame(registros)
+
+
+def extraer_tabla_pdf(file_bytes: bytes) -> tuple[pd.DataFrame, dict]:
+    """
+    Extrae la tabla principal usando 4 estrategias en cascada.
+    Retorna (DataFrame, metadatos).
+    """
+    meta = {}
+    texto_completo = ""
+
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            texto_completo += (page.extract_text() or "") + "\n"
+
+        meta = extraer_meta(texto_completo)
+
+        # Estrategia 1: tablas con bordes
+        tabla = extraer_tabla_estrategia1(pdf)
+        if tabla and len(tabla) > 2:
+            df = tabla_a_dataframe(tabla)
+            if not df.empty and len(df) >= 2:
+                df.attrs["estrategia"] = "1 — Detección de bordes"
+                return df, meta
+
+        # Estrategia 2: tablas sin bordes
+        tabla = extraer_tabla_estrategia2(pdf)
+        if tabla and len(tabla) > 2:
+            df = tabla_a_dataframe(tabla)
+            if not df.empty and len(df) >= 2:
+                df.attrs["estrategia"] = "2 — Detección por texto"
+                return df, meta
+
+    # Estrategia 3: regex sobre texto plano
+    tabla = extraer_tabla_estrategia3(texto_completo)
+    if tabla and len(tabla) > 2:
+        df = tabla_a_dataframe(tabla)
+        if not df.empty and len(df) >= 2:
+            df.attrs["estrategia"] = "3 — Parseo por expresiones regulares"
+            return df, meta
+
+    # Estrategia 4: parseo flexible
+    filas = extraer_tabla_estrategia4(texto_completo)
+    if filas:
+        df = pd.DataFrame(filas)
+        df.attrs["estrategia"] = "4 — Parseo flexible (revisar datos)"
+        return df, meta
+
+    return pd.DataFrame(), meta
 
 
 # ─────────────────────────────────────────────
@@ -665,8 +815,9 @@ if df_raw.empty:
     st.markdown("""
 <div class="alerta-amarilla">
 <strong>No se pudo extraer la tabla automáticamente.</strong><br>
-El PDF puede estar escaneado como imagen o tener un formato no estándar.
-Intente con un PDF descargado directamente desde el sistema PJUD (no escaneado).
+Se intentaron 4 métodos de extracción sin éxito. Esto puede ocurrir cuando el PDF
+tiene un formato de tabla muy particular. Use el editor manual a continuación para
+ingresar los datos — solo necesita las columnas principales.
 </div>
 """, unsafe_allow_html=True)
 
@@ -694,6 +845,14 @@ Intente con un PDF descargado directamente desde el sistema PJUD (no escaneado).
 
 # ── Tabla extraída ──
 st.markdown('<div class="seccion-titulo">Tabla extraída del PDF</div>', unsafe_allow_html=True)
+
+# Mostrar qué estrategia funcionó
+estrategia = df_raw.attrs.get("estrategia", "")
+if estrategia:
+    st.markdown(
+        f'<div class="alerta-verde">✓ Extracción exitosa — Método: {estrategia}</div>',
+        unsafe_allow_html=True,
+    )
 
 df_display = df_raw.copy()
 for col in ["capital", "interes_liq", "consig", "capital_am"]:
